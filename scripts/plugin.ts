@@ -1189,15 +1189,18 @@ async function linkCommand(args: readonly string[]): Promise<number> {
 
 /** `ovis join` (scripts/plugin-join.ts): this PC joins an account with an invite, through the same add as `ovis add`. */
 async function joinCommand(args: readonly string[]): Promise<number> {
+  const [{ absoluteInviteFile, join: joinPc, INVITE_READ_MAX, readInviteFile }, { discardTyped, linkSettings }] = await Promise.all([import("./plugin-join.ts"), import("./plugin-link.ts")]);
   const active = activePluginScript(ROOT, port, APP_STATE_DIR);
-  if (active !== join(resolve(ROOT), "scripts", "plugin.ts") && resolve(active) !== resolve(import.meta.filename)) return await handOn(active, ["join", ...args]);
-  const [{ join: joinPc, INVITE_READ_MAX }, { discardTyped, linkSettings }] = await Promise.all([import("./plugin-join.ts"), import("./plugin-link.ts")]);
+  // the release runs in its own folder: a relative invite file is named from here
+  if (active !== join(resolve(ROOT), "scripts", "plugin.ts") && resolve(active) !== resolve(import.meta.filename)) return await handOn(active, ["join", ...absoluteInviteFile(args, process.cwd())]);
+  // Ctrl+C ends the run from here on, while the invite is read too (handOn passes signals on to a release instead)
+  const signal = stopOnSignals();
   const running = await health();
   const headers: Record<string, string> = {};
   if ((env["OVIS_TOKEN"] ?? "") !== "") headers["authorization"] = `Bearer ${env["OVIS_TOKEN"]}`;
   const json = args.includes("--json");
   return joinPc(args, {
-    ...ownerCalls(), headers, signal: stopOnSignals(), running,
+    ...ownerCalls(), headers, signal, running,
     accountService: accountServiceOrigin(env["OVIS_ACCOUNT_SERVICE_URL"] ?? DEFAULT_ACCOUNT_SERVICE),
     ...linkSettings(env),
     out: (text) => process.stdout.write(text),
@@ -1209,10 +1212,7 @@ async function joinCommand(args: readonly string[]): Promise<number> {
     isTty: (json ? process.stderr : process.stdout).isTTY === true,
     // the caller's own environment only: an invite belongs in no settings file
     ...process.env["OVIS_INVITE"] === undefined ? {} : { inviteEnv: process.env["OVIS_INVITE"] },
-    readFile: (path) => {
-      if (statSync(path).size > INVITE_READ_MAX) throw new Error("too large for an invite");
-      return readFileSync(path, "utf8");
-    },
+    readFile: readInviteFile,
     readStdin: async () => {
       const chunks: Uint8Array[] = [];
       let size = 0;

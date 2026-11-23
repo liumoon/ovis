@@ -71,6 +71,11 @@ export async function handleAccountRequest(request: Request, pathname: string, c
       // connection with drive access (the PC's own screen, after listing it), or through the relay only by a
       // member of this PC's own account
       const account = body.account;
+      // null forgets the one named, over a direct connection only (`ovis join` that ended unbound puts back what it found)
+      if (account === null && peer.kind !== "relay") {
+        context.services.relay.clearRelayAccount();
+        return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+      }
       if (typeof account !== "string") return fail("invalid_account", "Name the account", 400);
       if (peer.kind === "relay" && !(devices.isAccountApproverSession(peer.device.id, peer.key) && devices.account() === account)) return fail("account_required", "Name this PC's account from a device linked to it", 403);
       if (!context.services.relay.setRelayAccount(account)) return fail("invalid_account", "Name the account", 400);

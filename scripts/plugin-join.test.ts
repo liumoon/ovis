@@ -4,7 +4,8 @@
  * clock the test moves. The invite routes are the account service's (shared/account-service-fake.ts).
  */
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import { bytesToHex } from "@noble/hashes/utils.js";
@@ -15,7 +16,8 @@ import { importPublicKey, importSecretKey } from "../shared/relay-e2ee.ts";
 import { encodeOffer } from "../shared/relay-offer.ts";
 import { answerServerChallenge } from "../shared/relay-server-proof.ts";
 import { loadRelayIdentity } from "../server/relay/identity.ts";
-import { join, JOIN_EXIT, parseJoinArgs } from "./plugin-join.ts";
+import { absoluteInviteFile, join, JOIN_EXIT, parseJoinArgs, readInviteFile } from "./plugin-join.ts";
+import { linkSettings } from "./plugin-link.ts";
 
 const ORIGIN = "http://127.0.0.1:7317";
 const SERVICE = "https://account.test";
@@ -79,6 +81,8 @@ interface Run {
   readonly listed: () => { server_id: string; listed_by_device?: boolean }[];
   /** the files this run's PC keeps, read whole */
   readonly stateDir: string;
+  /** this PC as the run left it: the account it is in and named for its relay pass (each naming in turn), its relay, how often it was stopped */
+  readonly state: { account: string | null; named: string | null; relayOn: boolean; namings: (string | null)[]; stops: number };
 }
 
 interface Setup {
@@ -100,8 +104,16 @@ interface Setup {
   readonly running?: boolean;
   readonly blocked?: string;
   readonly prepare?: (service: FakeAccountService, time: ReturnType<typeof clock>) => Promise<void> | void;
-  /** answers an account service call in the service's place */
-  readonly serviceAnswer?: (path: string, request: Request) => Response | Promise<Response> | undefined;
+  /** runs once the invite is made, before the run */
+  readonly afterMade?: (service: FakeAccountService) => Promise<void> | void;
+  /** answers an account service call in the service's place; `stop` is Ctrl+C */
+  readonly serviceAnswer?: (path: string, request: Request, stop: () => void, forward: () => Promise<Response>) => Response | Promise<Response | undefined> | undefined;
+  /** answers this PC's call in its server's place */
+  readonly localAnswer?: (path: string, request: Request) => Response | Promise<Response> | undefined;
+  /** the relay is off as the run starts, and the account named for this PC (none by default) */
+  readonly relayOff?: boolean;
+  readonly namedBefore?: string;
+  readonly settings?: Record<string, string>;
   readonly inviteEnv?: string | ((line: string) => string);
   readonly stdin?: string;
   readonly service?: FakeAccountService;
@@ -110,6 +122,8 @@ interface Setup {
   /** the account service and list id the invite's line names: this PC's service and no list by default */
   readonly inviteService?: string;
   readonly inviteList?: string;
+  /** the account the invite is for: acct_1 by default */
+  readonly inviteAccount?: string;
 }
 
 async function joining(setup: Setup = {}): Promise<Run> {
@@ -120,13 +134,15 @@ async function joining(setup: Setup = {}): Promise<Run> {
   const service = setup.service ?? new FakeAccountService(time.now);
   service.opensAll = true;
   await setup.prepare?.(service, time);
-  const owner = service.issueToken("acct_1");
-  const fresh = await newInvite(setup.inviteService ?? SERVICE, "acct_1", setup.inviteList ?? null);
+  const ACCOUNT = setup.inviteAccount ?? "acct_1";
+  const owner = service.issueToken(ACCOUNT);
+  const fresh = await newInvite(setup.inviteService ?? SERVICE, ACCOUNT, setup.inviteList ?? null);
   const made = await service.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${owner}`, "content-type": "application/json" }, body: JSON.stringify({ invite_key: fresh.key, ...setup.auto ? { auto: true } : {} }) }));
   expect(made.status).toBe(200);
+  await setup.afterMade?.(service);
   const madeLine = fresh.line;
   const line = setup.line?.(madeLine) ?? madeLine;
-  const state = { account: setup.inAccount ?? null as string | null, named: null as string | null };
+  const state = { account: setup.inAccount ?? null as string | null, named: setup.namedBefore ?? null as string | null, relayOn: setup.relayOff !== true, namings: [] as (string | null)[], stops: 0 };
   const local: string[] = [];
   const calls: string[] = [];
   const bodies: string[] = [];
@@ -139,7 +155,7 @@ async function joining(setup: Setup = {}): Promise<Run> {
     calls.push(`${request.method} ${path}`);
     bodies.push(await request.clone().text());
     expect(new URL(request.url).origin).toBe(SERVICE);
-    return await setup.serviceAnswer?.(path, request.clone()) ?? await service.fetch(request);
+    return await setup.serviceAnswer?.(path, request.clone(), () => stop.abort(), () => service.fetch(request.clone())) ?? await service.fetch(request);
   };
   const prove = async () => {
     const challenge = await (await serviceFetch(`${SERVICE}/v1/pc/challenge`, { method: "POST", body: JSON.stringify({ server_id: identity.server_id, public_key: bytesToHex(importPublicKey(identity.public_key)) }) })).json() as { challenge_id: string; frame: string };
@@ -153,12 +169,15 @@ async function joining(setup: Setup = {}): Promise<Run> {
     expect(url.origin).toBe(ORIGIN);
     const path = url.pathname;
     local.push(`${request.method} ${path}`);
+    const answered = await setup.localAnswer?.(path, request.clone());
+    if (answered !== undefined) return answered;
     if (path === "/api/account/status") return Response.json({ account: state.account, enrolling: false });
-    if (path === "/api/relay" && request.method === "GET") return Response.json({ phase: state.account === null ? "connecting" : "online", blocked: setup.blocked ?? null });
-    if (path === "/api/relay/start") return Response.json({ phase: "connecting", blocked: null });
+    if (path === "/api/relay" && request.method === "GET") return Response.json({ phase: !state.relayOn ? "off" : state.account === null ? "connecting" : "online", blocked: setup.blocked ?? null, relay_account: state.named });
+    if (path === "/api/relay/start") { state.relayOn = true; return Response.json({ phase: "connecting", blocked: null }); }
+    if (path === "/api/relay/stop") { state.relayOn = false; state.stops++; return Response.json({ phase: "off", blocked: null }); }
     if (path === "/api/relay/link") return Response.json({ url: encodeOffer({ v: 1, server_id: identity.server_id, server_public_key: identity.public_key, relay: RELAY, name: "old-desktop" }, "https://app.ovis.sh") });
     if (path === "/api/relay/link/close") return Response.json({ ok: true });
-    if (path === "/api/account/relay-account") { state.named = (await request.json() as { account: string }).account; return new Response(null, { status: 204 }); }
+    if (path === "/api/account/relay-account") { state.named = (await request.json() as { account: string | null }).account; state.namings.push(state.named); return new Response(null, { status: 204 }); }
     if (path === "/api/account/pc-proof") return Response.json(await prove());
     if (path === "/api/account/one-press") {
       const body = await request.json() as { account?: unknown };
@@ -166,7 +185,7 @@ async function joining(setup: Setup = {}): Promise<Run> {
       pressed.push(body.account);
       if (pressed.length === setup.stopAt) { stop.abort(); return refuse("no_admission", 404); }
       if (pressed.length === setup.pressAfter) {
-        const admit = await service.fetch(new Request(`${SERVICE}/v1/pcs/${identity.server_id}/admit`, { method: "POST", headers: { authorization: `Bearer ${service.issueToken("acct_1")}` }, body: "{}" }));
+        const admit = await service.fetch(new Request(`${SERVICE}/v1/pcs/${identity.server_id}/admit`, { method: "POST", headers: { authorization: `Bearer ${service.issueToken(ACCOUNT)}` }, body: "{}" }));
         expect(admit.status).toBe(200);
       }
       if (state.named !== body.account) return refuse("account_mismatch", 409);
@@ -197,6 +216,7 @@ async function joining(setup: Setup = {}): Promise<Run> {
   const code = await join(args, {
     origin: ORIGIN, headers: {}, fetch, serviceFetch, accountService: SERVICE, now: time.now, wait: time.wait, signal: stop.signal,
     lines: keys.lines, discard: keys.discard, terminal: setup.terminal ?? true, isTty: setup.isTty ?? true, running: setup.running ?? true,
+    ...linkSettings(setup.settings ?? {}),
     ...inviteEnv === undefined ? {} : { inviteEnv },
     platform: "linux",
     readFile: (path) => { if (path !== "/invite") throw new Error("ENOENT"); return `${line}\n`; },
@@ -205,8 +225,8 @@ async function joining(setup: Setup = {}): Promise<Run> {
     err: (text) => { err.push(text); heard(text); },
   });
   return {
-    code, out: out.join(""), err: err.join(""), line, made: madeLine, service, serverId: identity.server_id, local, calls, bodies, beforeQuestion, pressed, stateDir,
-    listed: () => service.pcs("acct_1").filter((entry) => entry.server_id === identity.server_id),
+    code, out: out.join(""), err: err.join(""), line, made: madeLine, service, serverId: identity.server_id, local, calls, bodies, beforeQuestion, pressed, stateDir, state,
+    listed: () => service.pcs(ACCOUNT).filter((entry) => entry.server_id === identity.server_id),
   };
 }
 
@@ -264,7 +284,7 @@ describe("ovis join: the invite", () => {
     }
     const unread = await joining({ args: ["--invite-file", "/elsewhere"] });
     expect(unread.code).toBe(JOIN_EXIT.usage);
-    expect(unread.out).toBe("Could not read the file --invite-file names. Nothing was sent.\n");
+    expect(unread.out).toBe("Could not read the file --invite-file names (it must be a file you can read). Nothing was sent.\n");
     expect(parseJoinArgs(["--json", "-", "--account=acct_1"])).toEqual({ source: { kind: "stdin" }, account: "acct_1", json: true });
   });
 
@@ -331,11 +351,27 @@ describe("ovis join: the account it joins", () => {
     expect(same.out).not.toContain("Is this your account?");
     expect(same.out).toContain("Ovis account acct_1 is the one --account names.\n");
     for (const other of ["acct_2", "acct_10", "acct"]) {
-      const run = await joining({ args: ["--invite-file", "/invite", `--account=${other}`] });
+      const run = await joining({ args: ["--invite-file", "/invite", `--account=${other}`, "--json"] });
       expect([other, run.code]).toEqual([other, JOIN_EXIT.account_mismatch]);
-      expect(run.out).toBe(`The invite is for Ovis account acct_1, not the one --account names (${other}). Nothing was sent, and the invite was not used.\n`);
+      // the invite's account is not named: whoever made the invite chose it
+      const said = "The invite is for another Ovis account than the one --account names. Nothing was sent, and the invite was not used. ovis status --json on a PC already in your account shows its full id.";
+      expect(run.err).toBe(`${said}\n`);
+      expect(JSON.parse(run.out)).toEqual({ ok: false, error: "account_mismatch", message: said });
       expect(run.local).toEqual([]);
       expect(run.calls).toEqual([]);
+    }
+  });
+
+  it("with --account, takes the account's start as Settings and ovis status show it (12 characters or more), as ovis add does", async () => {
+    const long = "acct_0123456789abcdef";
+    for (const given of [long, long.slice(0, 12), long.slice(0, 16)]) {
+      const run = await joining({ inviteAccount: long, args: ["--invite-file", "/invite", "--account", given], terminal: false, isTty: false, pressAfter: 1 });
+      expect([given, run.code]).toEqual([given, 0]);
+    }
+    for (const given of [long.slice(0, 11), `${long.slice(0, 12)}x`]) {
+      const run = await joining({ inviteAccount: long, args: ["--invite-file", "/invite", "--account", given], terminal: false, isTty: false });
+      expect([given, run.code]).toEqual([given, JOIN_EXIT.account_mismatch]);
+      expect(run.out).not.toContain(long.slice(0, 6));
     }
   });
 
@@ -349,6 +385,26 @@ describe("ovis join: the account it joins", () => {
     // standard input that carried the invite is no terminal to type at
     const piped = await joining({ args: ["-"] });
     expect(piped.code).toBe(JOIN_EXIT.not_confirmed);
+    // with --json nothing is asked, at a terminal too: --account names the account
+    const json = await joining({ args: ["--invite-file", "/invite", "--json"] });
+    expect(json.code).toBe(JOIN_EXIT.not_confirmed);
+    expect(json.beforeQuestion).toBeNull();
+    expect(JSON.parse(json.out)).toMatchObject({ ok: false, error: "not_confirmed" });
+    expect(json.err).toContain("With --json nothing is asked: name the account with ovis join --account <the account's id>");
+    expect(json.calls).toEqual([]);
+  });
+
+  it("under the fleet preview, asks at a terminal even with --account, as ovis add does, and refuses anywhere else", async () => {
+    const preview = { settings: { OVIS_PREVIEW: "fleet" } };
+    const asked = await joining({ ...preview, args: ["--invite-file", "/invite", "--account", "acct_1"], pressAfter: 1 });
+    expect(asked.code).toBe(0);
+    expect(asked.out).toContain(ASKED);
+    for (const setup of [{ terminal: false, isTty: false }, { args: ["--invite-file", "/invite", "--account", "acct_1", "--json"] }] as Setup[]) {
+      const refused = await joining({ ...preview, args: ["--invite-file", "/invite", "--account", "acct_1"], ...setup });
+      expect(refused.code).toBe(JOIN_EXIT.not_confirmed);
+      expect(refused.out + refused.err).toContain("Adding this PC needs a terminal");
+      expect(refused.calls).toEqual([]);
+    }
   });
 
   it("says so and redeems nothing when this PC is in that account already; refuses another account, naming logout", async () => {
@@ -357,8 +413,8 @@ describe("ovis join: the account it joins", () => {
     expect(same.out).toBe("This PC is already in Ovis account acct_1. The invite was not used.\n");
     expect(same.calls).toEqual([]);
     // the invite is still good for another PC
-    const json = await joining({ inAccount: "acct_1", args: ["--invite-file", "/invite", "--json"] });
-    expect(JSON.parse(json.out)).toEqual({ ok: true, account: "acct_1", added: false, waiting: false, online: null });
+    const json = await joining({ inAccount: "acct_1", args: ["--invite-file", "/invite", "--json", "--account", "acct_1"] });
+    expect(JSON.parse(json.out)).toEqual({ ok: true, account: "acct_1", added: false, online: null });
     const other = await joining({ inAccount: "acct_other0000" });
     expect(other.code).toBe(JOIN_EXIT.other_account);
     expect(other.out).toBe("This PC is in another Ovis account (acct_other00). Run ovis logout to take it out of that one first, then run ovis join again. The invite was not used.\n");
@@ -393,12 +449,12 @@ describe("ovis join: adding this PC", () => {
     expectNoInvite(run);
   });
 
-  it("nobody pressing Add in 10 minutes takes this PC off the account's list again, with its own exit code", async () => {
-    const run = await joining({ args: ["--invite-file", "/invite", "--json"] });
+  it("nobody pressing Add while its card offers it takes this PC off the account's list again, with its own exit code", async () => {
+    const run = await joining({ args: ["--invite-file", "/invite", "--json", "--account", "acct_1"] });
     expect(run.code).toBe(JOIN_EXIT.no_add);
     expect(run.code).not.toBe(JOIN_EXIT.invite_invalid);
     expect(run.err).toContain("Nobody pressed Add for old-desktop within 10 minutes of its listing. This PC was taken off your account's list; it is in no account. Ask for a new invite to try again.\n");
-    expect(JSON.parse(run.out)).toEqual({ ok: false, error: "no_add", message: "Nobody pressed Add for this PC within 10 minutes of its listing.", listed: false });
+    expect(JSON.parse(run.out)).toEqual({ ok: false, error: "no_add", message: "Nobody pressed Add for this PC while its card offered it.", listed: false });
     expect(run.calls).toContain(`POST /v1/pcs/${run.serverId}/leave`);
     expect(run.listed()).toEqual([]);
     expectNoInvite(run);
@@ -431,11 +487,11 @@ describe("ovis join: adding this PC", () => {
   });
 
   it("with --json: one object on stdout at the end, every other word on stderr, and no watch for a first device even at a terminal", async () => {
-    const run = await joining({ args: ["--json", "--invite-file", "/invite"], pressAfter: 1 });
+    const run = await joining({ args: ["--json", "--invite-file", "/invite", "--account", "acct_1"], pressAfter: 1 });
     expect(run.code).toBe(0);
     expect(run.out.split("\n")).toHaveLength(2);
-    expect(JSON.parse(run.out)).toEqual({ ok: true, account: "acct_1", added: true, waiting: false, online: true });
-    expect(run.err).toContain(ASKED);
+    expect(JSON.parse(run.out)).toEqual({ ok: true, account: "acct_1", added: true, online: true });
+    expect(run.err).toContain("Ovis account acct_1 is the one --account names.\n");
     expect(run.err).toContain("Added. Open old-desktop from My PCs.\n");
     expect(run.local).not.toContain("GET /api/relay/joins");
     expectNoInvite(run);
@@ -444,6 +500,7 @@ describe("ovis join: adding this PC", () => {
 
 describe("ovis join: what the account service says", () => {
   const plainly = (setup: Setup = {}) => joining({ args: ["--invite-file", "/invite", "--account", "acct_1", "--json"], terminal: false, isTty: false, ...setup });
+  const UNCLEAR = "The account service did not say whether it took this PC. Try again in a moment. This PC was taken off that account's list again; the invite may be spent.";
   const answered = (code: string, status: number, headers: Record<string, string> = {}) => (path: string) =>
     path === "/v1/pc-invites/redeem" ? Response.json({ error: { code, message: `the service's own words ${code}` } }, { status, headers }) : undefined;
 
@@ -481,8 +538,9 @@ describe("ovis join: what the account service says", () => {
       [{ serviceAnswer: answered("pc_add_cap", 429, { "retry-after": "18000" }) }, "pc_add_cap", "Your Ovis account has added as many PCs as it may for now: try again in 5 hours. The invite was not used."],
       [{ serviceAnswer: answered("directory_full", 409) }, "directory_full", "Your account holds as many PCs as it can. Remove one in the Ovis app, then run ovis join again (with a new invite once this one ran out)."],
       [{ serviceAnswer: answered("not_found", 404) }, "not_available", "The account service takes no PC invites for this account. Add this PC with ovis add instead."],
-      [{ serviceAnswer: answered("internal", 500) }, "service_unreachable", "The account service did not answer this PC (HTTP 500). Try again in a moment: the invite works for 15 minutes."],
-      [{ serviceAnswer: (path: string) => { if (path === "/v1/pc-invites/redeem") throw new TypeError("fetch failed"); return undefined; } }, "service_unreachable", "Could not reach the account service. Check this PC's internet connection and try again: the invite works for 15 minutes."],
+      [{ serviceAnswer: answered("internal", 500) }, "service_unreachable", UNCLEAR],
+      [{ serviceAnswer: (path: string) => { if (path === "/v1/pc-invites/redeem") throw new TypeError("fetch failed"); return undefined; } }, "service_unreachable", UNCLEAR],
+      [{ serviceAnswer: (path: string) => path === "/v1/pc-invites/redeem" ? new Response("<html>", { status: 200 }) : undefined }, "service_unreachable", UNCLEAR],
       [{ serviceAnswer: answered("list_endpoint", 409) }, "not_added", "The account service did not take this PC (list_endpoint). This PC was not added."],
       [{ blocked: "serve_only" }, "relay_unavailable", "The Ovis relay cannot run here (serve_only). Nothing was sent."],
       [{ running: false }, "not_running", "Ovis is not running on this PC. Start it (ovis start, or open the app), then run this again."],
@@ -493,6 +551,7 @@ describe("ovis join: what the account service says", () => {
       expect([error, object.ok, object.error, object.message]).toEqual([error, false, error, said]);
       expect(run.err.endsWith(`${said}\n`)).toBe(true);
       expect(run.err).not.toContain("the service's own words");
+      if (said === UNCLEAR) expect([error, run.calls.filter((call) => call === "POST /v1/pc-invites/redeem").length, run.calls.at(-1)]).toEqual([error, 3, `POST /v1/pcs/${run.serverId}/leave`]);
       if (error === "rate_limited") expect(object.retry_after).toBe(60);
       if (error === "pc_add_cap") expect(object.retry_after).toBe(18000);
       expect(run.listed()).toEqual([]);
@@ -508,10 +567,14 @@ describe("ovis join: what the account service says", () => {
     } });
     expect(run.code).toBe(0);
     expect(run.calls.filter((call) => call === "POST /v1/pc-invites/redeem")).toHaveLength(3);
+    // each try answers a challenge of its own, with a signature of its own
+    const tried = run.bodies.filter((_, index) => run.calls[index] === "POST /v1/pc-invites/redeem").map((body) => JSON.parse(body) as { challenge_id: string; invite_signature: string });
+    expect(new Set(tried.map((body) => body.challenge_id)).size).toBe(3);
+    expect(new Set(tried.map((body) => body.invite_signature)).size).toBe(3);
   });
 
   it("an account's daily PC adds used up answer an auto invite's redeem with pc_add_cap and its retry-after", async () => {
-    const run = await plainly({ auto: true, prepare: async (service) => {
+    const run = await plainly({ auto: true, afterMade: async (service) => {
       // three PCs added in one press today
       for (let added = 0; added < 3; added++) {
         const other = mkdtempSync(joinPath(tmpdir(), "ovis-join-other-"));
@@ -536,8 +599,160 @@ describe("ovis join: what the account service says", () => {
     await joining({ service, time, stateDir, args: ["--invite-file", "/invite", "--account", "acct_1"], terminal: false, isTty: false, stopAt: 1, line: (made) => { line = made; return made; }, serviceAnswer: (path) => path.endsWith("/leave") ? Response.json({}, { status: 503 }) : undefined });
     time.pass(11 * 60_000);
     const run = await joining({ service, time, stateDir, args: ["--invite-file", "/invite", "--account", "acct_1", "--json"], terminal: false, isTty: false, line: () => line });
-    expect(run.code).toBe(JOIN_EXIT.not_added);
-    expect(run.err).toContain("Could not add this PC: listing_expired. This PC was taken off your account's list; it is in no account. Ask for a new invite to try again.\n");
+    // the service's card_until said so: no wait for an Add nobody can press
+    expect(run.code).toBe(JOIN_EXIT.no_add);
+    expect(JSON.parse(run.out)).toEqual({ ok: false, error: "no_add", listed: false,
+      message: "The card that offers Add for this PC ran out 10 minutes after the invite was first used. Ask for a new invite. This PC was taken off that account's list again; the invite may be spent." });
+    expect(run.pressed).toEqual([]);
     expect(run.listed()).toEqual([]);
+  });
+});
+
+describe("ovis join: what a run that does not finish leaves", () => {
+  const pinned = { args: ["--invite-file", "/invite", "--account", "acct_1", "--json"], terminal: false, isTty: false } as const;
+  const redeems = (run: Run) => run.calls.filter((call) => call === "POST /v1/pc-invites/redeem").length;
+  const leaves = (run: Run) => run.calls.filter((call) => call.endsWith("/leave")).length;
+
+  it("asks again when the service's answer to the redeem was lost, and the same PC and key get the same listing", async () => {
+    let lost = false;
+    const run = await joining({ ...pinned, pressAfter: 1, serviceAnswer: async (path, _request, _stop, forward) => {
+      if (path !== "/v1/pc-invites/redeem" || lost) return undefined;
+      lost = true;
+      // the service took it; its answer never came back
+      expect((await forward()).status).toBe(200);
+      throw new TypeError("connection reset");
+    } });
+    expect(run.code).toBe(0);
+    expect([redeems(run), leaves(run)]).toEqual([2, 0]);
+    expect(run.listed().map((entry) => entry.listed_by_device)).toEqual([false]);
+  });
+
+  it("takes the PC off the list when the service took the redeem but no answer could be read, and says the invite may be spent", async () => {
+    const run = await joining({ ...pinned, serviceAnswer: async (path, _request, _stop, forward) => {
+      if (path !== "/v1/pc-invites/redeem") return undefined;
+      await forward();
+      return new Response("upstream timed out", { status: 504 });
+    } });
+    expect(run.code).toBe(JOIN_EXIT.service_unreachable);
+    expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "service_unreachable", listed: false });
+    expect([redeems(run), leaves(run)]).toEqual([3, 1]);
+    expect(run.listed()).toEqual([]);
+  });
+
+  it("Ctrl+C while the redeem is on its way takes off what it may have listed, and still prints its one object", async () => {
+    const run = await joining({ ...pinned, serviceAnswer: async (path, _request, stop, forward) => {
+      if (path !== "/v1/pc-invites/redeem") return undefined;
+      await forward();
+      stop();
+      throw new DOMException("aborted", "AbortError");
+    } });
+    expect(run.code).toBe(JOIN_EXIT.stopped);
+    expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "stopped", listed: false });
+    expect(leaves(run)).toBe(1);
+    expect(run.listed()).toEqual([]);
+  });
+
+  it("takes off the listing the service made under another account than the invite's, and adds nothing", async () => {
+    const run = await joining({ ...pinned, serviceAnswer: (path) => path === "/v1/pc-invites/redeem"
+      ? Response.json({ account: "acct_2", listing_id: "0".repeat(32), auto: false, card_until: null, admission_until: null }) : undefined });
+    expect(run.code).toBe(JOIN_EXIT.not_added);
+    expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "not_added", listed: false });
+    const left = JSON.parse(run.bodies[run.calls.findIndex((call) => call.endsWith("/leave"))]!) as { account: string };
+    expect(left.account).toBe("acct_2");
+    expect(run.pressed).toEqual([]);
+  });
+
+  it("an auto invite asks a few times for its admission, and when it is not there takes the PC off the list", async () => {
+    let asks = 0;
+    const missing = (path: string) => path === "/v1/pc/admission" && ++asks <= 2 ? Response.json({ error: { code: "no_admission", message: "none" } }, { status: 404 }) : undefined;
+    const late = await joining({ ...pinned, auto: true, serviceAnswer: missing });
+    expect(late.code).toBe(0);
+    expect(late.pressed).toHaveLength(3);
+    const never = await joining({ ...pinned, auto: true, serviceAnswer: (path) => path === "/v1/pc/admission" ? Response.json({ error: { code: "no_admission", message: "none" } }, { status: 404 }) : undefined });
+    expect(never.code).toBe(JOIN_EXIT.not_added);
+    expect(never.pressed).toHaveLength(3);
+    expect(JSON.parse(never.out)).toMatchObject({ ok: false, error: "not_added", listed: false });
+    expect(never.listed()).toEqual([]);
+  });
+
+  it("puts back the account named for the relay pass and the relay it turned on, and closes its window, when it ends unbound", async () => {
+    for (const namedBefore of [undefined, "acct_9"]) {
+      const run = await joining({ ...pinned, relayOff: true, ...namedBefore === undefined ? {} : { namedBefore } });
+      expect(run.code).toBe(JOIN_EXIT.no_add);
+      expect(run.state.namings.at(-1)).toBe(namedBefore ?? null);
+      expect(run.state.named).toBe(namedBefore ?? null);
+      expect([run.state.relayOn, run.state.stops]).toEqual([false, 1]);
+      expect(run.local.at(-1)).not.toBe("POST /api/relay/link");
+      expect(run.local).toContain("POST /api/relay/link/close");
+    }
+    // added: the relay stays on, named for the account it is in
+    const added = await joining({ ...pinned, relayOff: true, pressAfter: 1 });
+    expect(added.code).toBe(0);
+    expect([added.state.relayOn, added.state.stops, added.state.named]).toEqual([true, 0, "acct_1"]);
+    // a relay that was on stays on
+    const on = await joining({ ...pinned });
+    expect([on.state.relayOn, on.state.stops]).toEqual([true, 0]);
+  });
+
+  it("asks once more for an Add pressed in the card's last seconds before it takes the PC off the list", async () => {
+    // the 101st ask is the one after the wait: an Add pressed just then is taken
+    const run = await joining({ ...pinned, pressAfter: 102 });
+    expect(run.code).toBe(0);
+    expect(leaves(run)).toBe(0);
+    expect(run.pressed).toHaveLength(102);
+  });
+
+  it("waits for Add only as long as the service says the card offers it", async () => {
+    const time = clock();
+    const service = new FakeAccountService(time.now);
+    const stateDir = mkdtempSync(joinPath(tmpdir(), "ovis-join-"));
+    scratch.push(stateDir);
+    let line = "";
+    await joining({ ...pinned, service, time, stateDir, stopAt: 1, line: (made) => { line = made; return made; }, serviceAnswer: (path) => path.endsWith("/leave") ? Response.json({}, { status: 503 }) : undefined });
+    time.pass(4 * 60_000);
+    const again = await joining({ ...pinned, service, time, stateDir, line: () => line });
+    const [, minutes] = /Waiting… \(up to (\d+):\d\d, Ctrl\+C to stop\)/.exec(again.err) ?? [];
+    // 10 minutes from the first redeem, 4 of them gone: not 10 from this run
+    expect(Number(minutes), again.err).toBe(6);
+    expect(again.code).toBe(JOIN_EXIT.no_add);
+  });
+
+  it("prints one object with its own exit code for any error of its own: a local answer that is not JSON, a relay key that does not read", async () => {
+    for (const localAnswer of [
+      (path: string) => path === "/api/relay/link" ? new Response("not json", { status: 200 }) : undefined,
+      (path: string) => path === "/api/relay/link" ? Response.json({ url: 42 }) : undefined,
+    ]) {
+      const run = await joining({ ...pinned, localAnswer });
+      expect(run.code, run.err).toBe(JOIN_EXIT.internal);
+      expect(run.out.split("\n")).toHaveLength(2);
+      expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "internal" });
+      expect(run.calls).toEqual([]);
+    }
+  });
+});
+
+describe("ovis join: the invite file", () => {
+  it("reads a regular file up to the cap and one byte more, and refuses a FIFO, a folder or a device at once", async () => {
+    const dir = mkdtempSync(joinPath(tmpdir(), "ovis-join-file-"));
+    scratch.push(dir);
+    const file = joinPath(dir, "invite");
+    writeFileSync(file, "ovis-join:1:x\n");
+    expect(readInviteFile(file)).toBe("ovis-join:1:x\n");
+    writeFileSync(file, "x".repeat(10_000));
+    expect(readInviteFile(file)).toHaveLength(4097);
+    const fifo = joinPath(dir, "fifo");
+    if (process.platform !== "win32" && spawnSync("mkfifo", [fifo]).status === 0) {
+      const started = Date.now();
+      expect(() => readInviteFile(fifo)).toThrow();
+      expect(Date.now() - started).toBeLessThan(1_000);
+    }
+    expect(() => readInviteFile(dir)).toThrow();
+    if (process.platform !== "win32") expect(() => readInviteFile("/dev/zero")).toThrow();
+  });
+
+  it("names a relative --invite-file from the caller's folder, for a release that runs elsewhere", () => {
+    expect(absoluteInviteFile(["--invite-file", "inv.txt", "--account", "a"], "/home/me")).toEqual(["--invite-file", "/home/me/inv.txt", "--account", "a"]);
+    expect(absoluteInviteFile(["--invite-file=sub/inv", "--json"], "/w")).toEqual(["--invite-file=/w/sub/inv", "--json"]);
+    expect(absoluteInviteFile(["--invite-file", "/abs/inv", "-"], "/w")).toEqual(["--invite-file", "/abs/inv", "-"]);
   });
 });

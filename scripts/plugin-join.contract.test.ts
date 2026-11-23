@@ -12,7 +12,6 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 
 import { pairingPc, type Pc } from "../server/account/pairing.test-helpers.ts";
 import { bounded } from "../server/relay/test-helpers.ts";
-import { handleRelayRequest } from "../server/relay/routes.ts";
 import { importPublicKey } from "../shared/relay-e2ee.ts";
 import { newInvite, signInviteRedeem } from "../shared/account-list-invite.ts";
 import { readJoinLine } from "../shared/account-list-join.ts";
@@ -54,7 +53,7 @@ function stateFiles(dir: string): string[] {
  * `ovis join --account OWNER --json` as an agent runs it, with no terminal. `heard` sees each line it says on stderr, and
  * may press Add on a device of the account (`press`) or stop the run (`stop`).
  */
-async function joining(made: Pc, line: string, heard: (text: string, act: { press: () => void; stop: () => void }) => void = () => undefined) {
+async function joining(made: Pc, line: string, heard: (text: string, act: { press: () => void; stop: () => void }) => void = () => undefined, pressAt?: number) {
   const serverId = made.app.context.services.relay.currentIdentity()!.server_id;
   const stop = new AbortController();
   const out: string[] = [];
@@ -65,12 +64,14 @@ async function joining(made: Pc, line: string, heard: (text: string, act: { pres
   const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init);
     const path = new URL(request.url).pathname;
-    if (path === "/api/relay" && request.method === "GET") return Response.json({ phase: made.devices.account() === null ? "connecting" : "online", blocked: null });
+    // the harness's relay never comes online: the command is told it does once the PC is in the account
+    if (path === "/api/relay" && request.method === "GET") return Response.json({ ...await (await globalThis.fetch(request)).json() as object, phase: made.devices.account() === null ? "connecting" : "online" });
     const body = request.method === "POST" ? await request.clone().text() : "";
     const response = await globalThis.fetch(request);
     if (path === "/api/account/one-press" && body !== "{}") {
       asked.push(response.status);
       waiting.push((await made.status()).waiting_for_add);
+      if (asked.length === pressAt) { act.press(); await pressed; }
     }
     return response;
   };
@@ -94,14 +95,15 @@ async function joining(made: Pc, line: string, heard: (text: string, act: { pres
 test("a plain invite: the PC lists itself on its own proof, waits for Add on a device of the account, takes that admission and is in the account; the invite is in none of its files", async () => {
   const made = await fresh();
   const line = await inviteFor(made);
-  const run = await joining(made, line, (text, act) => { if (text.includes("press Add for")) act.press(); });
+  // Add is pressed only after two asks found none, so the PC was seen waiting
+  const run = await joining(made, line, undefined, 2);
   expect((await run.pressed)?.status).toBe(200);
   expect(run.code).toBe(0);
-  expect(JSON.parse(run.out)).toEqual({ ok: true, account: OWNER, added: true, waiting: false, online: true });
+  expect(JSON.parse(run.out)).toEqual({ ok: true, account: OWNER, added: true, online: true });
   expect(made.devices.account()).toBe(OWNER);
   expect(made.account.pcs(OWNER).map((entry) => [entry.server_id, entry.listed_by_device])).toEqual([[run.serverId, false]]);
   // the PC said it waits for Add while no admission was there, and not once it was in
-  expect(run.waiting.slice(0, -1).every((said) => said === true)).toBe(true);
+  expect(run.waiting.slice(0, -1)).toEqual([true, true]);
   expect(run.waiting.at(-1)).toBe(false);
   expect((await made.status()).waiting_for_add).toBe(false);
   for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) for (const secret of secrets(line)) expect(text.includes(secret)).toBe(false);
@@ -125,6 +127,8 @@ test("stopped while it waits, the PC takes itself off the account's list by its 
   expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "stopped", listed: false });
   expect(made.devices.account()).toBeNull();
   expect(made.account.pcs(OWNER)).toEqual([]);
+  // the account it named for the relay pass is forgotten again: there was none before
+  expect((await made.local("/api/relay")).body.relay_account).toBeNull();
   for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) for (const secret of secrets(line)) expect(text.includes(secret)).toBe(false);
 });
 
@@ -155,10 +159,25 @@ test("past a plain invite's ten minutes this PC answers one press with listing_e
   expect((await made.status()).waiting_for_add).toBe(false);
 });
 
-test("GET /api/relay names this PC's ID to its own window and CLI only", async () => {
-  const made = await fresh();
-  const own = await made.local("/api/relay");
-  expect(own.body.server_id).toBe(made.app.context.services.relay.currentIdentity()!.server_id);
-  const other = await handleRelayRequest(new Request(`http://127.0.0.1:${made.app.port}/api/relay`), "/api/relay", made.app.context, "0123456789abcdef", false, false);
-  expect(Object.keys(await other.json() as object)).not.toContain("server_id");
+test("GET /api/relay names this PC's ID and its named account to its own window and CLI only, as dispatch decides", async () => {
+  const made = await pairingPc({ server: { accountOpensAll: true, token: "the-token" }, startRelay: false });
+  pcs.push(made);
+  const base = `http://127.0.0.1:${made.app.port}`;
+  const ask = (path: string, extra: Record<string, string> = {}, body?: unknown) => fetch(base + path, {
+    method: body === undefined ? "GET" : "POST", headers: { origin: base, authorization: "Bearer the-token", "x-herdr-machine": "1", "x-herdr-update": "1", ...body === undefined ? {} : { "content-type": "application/json" }, ...extra },
+    ...body === undefined ? {} : { body: JSON.stringify(body) },
+  });
+  expect((await ask("/api/relay/start", {}, {})).status).toBe(200);
+  expect((await ask("/api/account/relay-account", {}, { account: OWNER })).status).toBe(204);
+  const serverId = made.app.context.services.relay.currentIdentity()!.server_id;
+  // this PC's own CLI: loopback, its token, nothing forwarded
+  expect(await (await ask("/api/relay")).json()).toMatchObject({ server_id: serverId, relay_account: OWNER });
+  // the same token through a proxy is not this PC's own window
+  const forwarded = await (await ask("/api/relay", { "x-forwarded-for": "100.64.0.9" })).json() as Record<string, unknown>;
+  expect(forwarded.phase).toBeDefined();
+  expect(Object.keys(forwarded)).not.toContain("server_id");
+  expect(Object.keys(forwarded)).not.toContain("relay_account");
+  // null forgets the named account, from this PC only
+  expect((await ask("/api/account/relay-account", {}, { account: null })).status).toBe(204);
+  expect(await (await ask("/api/relay")).json()).toMatchObject({ relay_account: null, account_named: false });
 });

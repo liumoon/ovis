@@ -845,6 +845,9 @@ export class FakeAccountService {
       if (!recent) return problem(403, "session_not_fresh", "Sign in again on this device first");
       if (!this.withinRateLimit(`invites:${account}`, INVITES_PER_WINDOW)) return limited("rate_limited", 60);
       if ([...this.invites.values()].filter((invite) => invite.account === account && open(invite)).length >= INVITES_OPEN_MAX) return problem(409, "invites_full", "Revoke an open invite first");
+      // an auto invite would be refused at its redeem: it is refused here, while the person who makes it is there to read why
+      const times = (this.admitTimes.get(account) ?? []).filter((at) => now - at < PC_NEW_MS);
+      if (made.auto === true && times.length >= PC_ADMITS_PER_DAY) return limited("pc_add_cap", Math.ceil((times[0]! + PC_NEW_MS - now) / 1000));
       // a key is an invite once, of any account, open or not
       if ([...this.invites.values()].some((invite) => invite.key === made.invite_key)) return problem(409, "invite_key_used", "Make a new key for a new invite");
       const invite: FakeInvite = { id: randomHex(16), account, key: made.invite_key, auto: made.auto === true, family: session.family, madeAt: now, revoked: false, used: null };
@@ -910,7 +913,7 @@ export class FakeAccountService {
     const before = directory.get(serverId);
     if (invite.used !== null) {
       const same = invite.used.server_id === serverId && invite.used.public_key === publicKey && before?.listing_id === invite.used.listing_id;
-      return same ? json({ account, listing_id: invite.used.listing_id, auto: invite.auto }) : dead;
+      return same ? json(redeemed(account, invite.used.listing_id, invite.auto, invite.used.at)) : dead;
     }
     if (before === undefined && directory.size >= DIRECTORY_MAX) return problem(409, "directory_full", "Remove a PC first");
     const times = (this.admitTimes.get(account) ?? []).filter((at) => this.now() - at < PC_NEW_MS);
@@ -925,7 +928,8 @@ export class FakeAccountService {
     this.inviteCards.delete(place);
     if (invite.auto) {
       this.admitTimes.set(account, [...times, at]);
-      this.pcAdmissions.set(place, { at, taken: false, family: invite.family, listing });
+      // the invite's own, not its maker's sign-in: signing out after making it does not undo it (DELETE does)
+      this.pcAdmissions.set(place, { at, taken: false, family: `invite:${invite.id}`, listing });
       this.usedAccounts.add(account);
       entry.new_until = new Date(at + PC_NEW_MS).toISOString();
       entry.admitted_at = new Date(at).toISOString();
@@ -935,7 +939,7 @@ export class FakeAccountService {
     this.pcLeaves.delete(place);
     invite.used = { at, server_id: serverId, public_key: publicKey, listing_id: listing, label, os: accountOsOf(body.os), ...this.requestPlace };
     this.ring(account, "");
-    return json({ account, listing_id: listing, auto: invite.auto });
+    return json(redeemed(account, listing, invite.auto, at));
   }
 
   /**
@@ -1153,6 +1157,15 @@ function json(body: unknown, status = 200): Response {
 
 function problem(status: number, code: string, message: string): Response {
   return json({ error: { code, message } }, status);
+}
+
+/**
+ * A redeem's answer, the same for every rerun: the card that offers Add for a plain invite's PC lasts until
+ * `card_until`, and an auto invite's admission waits to be taken until `admission_until`; the other is null.
+ */
+function redeemed(account: string, listing: string, auto: boolean, at: number) {
+  const until = new Date(at + ADMISSION_TTL_MS).toISOString();
+  return { account, listing_id: listing, auto, card_until: auto ? null : until, admission_until: auto ? until : null };
 }
 
 function limited(code: "rate_limited" | "pc_add_cap", seconds: number): Response {

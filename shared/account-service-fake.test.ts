@@ -885,36 +885,57 @@ describe("PC invites (POST /v1/pc-invites, /v1/pc-invites/redeem)", () => {
     expect(await redeem(service, expired, pc())).toEqual(dead);
   });
 
-  test("an auto invite admits the PC at once, for 10 minutes; past the account's daily one-press cap it answers pc_add_cap with retry-after and stays open", async () => {
+  test("an auto invite admits the PC at once, until admission_until; its maker signing out does not undo it", async () => {
     let now = Date.parse("2026-11-24T00:00:00Z");
     const service = new FakeAccountService(() => now);
     service.opensAll = true;
     const machine = pc();
-    expect((await redeem(service, await invite(service, "acct_1", true), machine)).body).toMatchObject({ account: "acct_1", auto: true });
+    const first = await redeem(service, await invite(service, "acct_1", true), machine);
+    expect(first.body).toEqual({ account: "acct_1", listing_id: first.body.listing_id, auto: true, card_until: null, admission_until: "2026-11-24T00:10:00.000Z" });
     expect((await admission(service, machine)).status).toBe(200);
-    // two more PCs fill the day's three adds
+    // made, then its maker signs out: the PC that redeems it still takes its admission
+    const owner = service.issueToken("acct_1");
+    const fresh = await newInvite(BASE, "acct_1", null);
+    expect((await made(service, owner, { invite_key: fresh.key, auto: true })).status).toBe(200);
+    expect((await service.fetch(post("/v1/signout", {}, owner))).status).toBe(204);
+    const other = pc();
+    expect((await redeem(service, fresh.line, other)).status).toBe(200);
+    expect((await admission(service, other)).status).toBe(200);
+  });
+
+  test("past the account's daily one-press cap an auto invite is refused at making, and one made before answers pc_add_cap at its redeem and stays open", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.opensAll = true;
+    expect((await redeem(service, await invite(service, "acct_1", true), pc())).status).toBe(200);
+    const early = await invite(service, "acct_1", true);
     for (let added = 0; added < 2; added++) expect((await redeem(service, await invite(service, "acct_1", true), pc())).status).toBe(200);
-    const capped = await invite(service, "acct_1", true);
+    // the day's three adds are used: a new auto invite is refused where it is made, a plain one is not
+    const refused = await service.fetch(post("/v1/pc-invites", { invite_key: (await newInvite(BASE, "acct_1", null)).key, auto: true }, service.issueToken("acct_1")));
+    expect([refused.status, ((await refused.clone().json()) as { error: { code: string } }).error.code]).toEqual([429, "pc_add_cap"]);
+    expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(await invite(service)).toStartWith("ovis-join:1:");
     const late = pc();
-    const read = await readJoinLine(capped);
-    const proof = await proofOf(service, late);
-    const response = await service.fetch(post("/v1/pc-invites/redeem", { invite_key: read.key, invite_signature: await signInviteRedeem({ account: "acct_1", server_id: late.serverId, public_key: late.publicKey, challenge_id: proof.challenge_id }, read.privateKey),
-      server_id: late.serverId, public_key: late.publicKey, relay: "wss://relay.ovis.sh", label: "Late", ...proof }));
-    expect(response.status).toBe(429);
-    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("pc_add_cap");
-    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+    const response = await redeem(service, early, late);
+    expect(response.body.error?.code).toBe("pc_add_cap");
     expect(service.pcs("acct_1").some((entry) => entry.server_id === late.serverId)).toBe(false);
-    // still open: asked again within its 15 minutes, it answers the same
-    expect((await redeem(service, capped, late)).body.error?.code).toBe("pc_add_cap");
+    // still open: asked again within its 15 minutes, it answers the same; after them it is dead
+    expect((await redeem(service, early, late)).body.error?.code).toBe("pc_add_cap");
     now += 24 * 60 * 60_000;
-    expect((await redeem(service, capped, late)).body.error?.code).toBe("invite_invalid");
-    // the cap is past, but this invite's 15 minutes too: a new one adds it
+    expect((await redeem(service, early, late)).body.error?.code).toBe("invite_invalid");
     expect((await redeem(service, await invite(service, "acct_1", true), late)).status).toBe(200);
-    // an auto admission not taken within 10 minutes is gone
+  });
+
+  test("an auto admission not taken within its 10 minutes is gone, and a plain invite's redeem names its card's end", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.opensAll = true;
     const slow = pc();
     expect((await redeem(service, await invite(service, "acct_1", true), slow)).status).toBe(200);
     now += 10 * 60_000 + 1;
     expect((await admission(service, slow)).body.error?.code).toBe("no_admission");
+    const plain = await redeem(service, await invite(service), pc());
+    expect(plain.body).toMatchObject({ auto: false, card_until: new Date(now + 10 * 60_000).toISOString(), admission_until: null });
   });
 
   test("a plain invite's card offers Add for 10 minutes: then Add and the PC's ask answer listing_expired; the PC's leave ends the listing", async () => {

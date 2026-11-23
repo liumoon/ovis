@@ -14,13 +14,16 @@
  * line on the command line shows in the process list, so the help and the docs name the file and standard input forms
  * first.
  */
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { accountOsOfPlatform } from "../shared/account-asker.ts";
 import { InviteRedeemError, signInviteRedeem } from "../shared/account-list-invite.ts";
 import { JoinLineError, readJoinLine } from "../shared/account-list-join.ts";
 import { isLoopbackHost } from "../server/access.ts";
 import { shortAccount } from "./plugin-cli.ts";
 import {
-  addByPress, askLine, AwayError, cli, LocalError, localApi, openedListing, plainLabel, relayOn, takesPress,
+  addByPress, askLine, AwayError, cli, LocalError, localApi, openedListing, pins, plainLabel, relayOn, takesPress,
   type Api, type LinkOptions, type PressEnd, type PressWords, type Unlisted,
 } from "./plugin-link.ts";
 
@@ -44,6 +47,7 @@ export const JOIN_EXIT = {
   relay_unavailable: 12,
   not_running: 13,
   no_add: 14,
+  internal: 15,
 } as const;
 
 export type JoinError = Exclude<keyof typeof JOIN_EXIT, "ok">;
@@ -62,6 +66,29 @@ export interface JoinOptions extends LinkOptions {
 
 /** An invite read from a file or standard input is a line: anything longer is not one. */
 export const INVITE_READ_MAX = 4096;
+
+/**
+ * The invite file `--invite-file` names, read at most to INVITE_READ_MAX and one byte more. Opened without waiting and
+ * refused unless it is a regular file, so a FIFO or a device never holds the run where Ctrl+C cannot end it.
+ */
+export function readInviteFile(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
+    const buffer = Buffer.alloc(INVITE_READ_MAX + 1);
+    let length = 0;
+    for (let read = 1; read > 0 && length < buffer.length; length += read) read = readSync(fd, buffer, length, buffer.length - length, null);
+    return buffer.toString("utf8", 0, length);
+  } finally { closeSync(fd); }
+}
+
+/** The words after `ovis join` with a relative `--invite-file` made absolute from `cwd`: a release it is handed on to runs elsewhere. */
+export function absoluteInviteFile(args: readonly string[], cwd: string): string[] {
+  return args.map((arg, index) => {
+    if (arg.startsWith("--invite-file=")) return `--invite-file=${resolve(cwd, arg.slice("--invite-file=".length))}`;
+    return args[index - 1] === "--invite-file" && arg !== "" && !arg.startsWith("-") ? resolve(cwd, arg) : arg;
+  });
+}
 
 const ACCOUNT_SHAPE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -120,13 +147,46 @@ function inTime(seconds: number | null): string {
 interface Outcome {
   readonly code: number;
   readonly json: Record<string, unknown>;
+  readonly message?: string;
 }
 
 const failed = (error: JoinError, message: string, extra: Record<string, unknown> = {}): Outcome & { readonly message: string } =>
   ({ code: JOIN_EXIT[error], message, json: { ok: false, error, message, ...extra } });
 
-/** The answer of the account service to a redeem, or why there is none. */
-type Redeemed = { readonly account: string; readonly listing: string; readonly auto: boolean } | (Outcome & { readonly message: string });
+/** The account service's word on a redeem: listed (with when its card or its admission ends), or why not. */
+type Redeemed = { readonly account: string; readonly auto: boolean; readonly until: number | null } | (Outcome & { readonly message: string });
+
+/**
+ * What a run changed on this PC on its way to the account, so one that ends unbound puts it back: the account it named
+ * for the relay pass (and the one named before; undefined where this PC does not say), the relay it turned on, the
+ * approve-here window that listing opens, and the account whose list may hold this PC by this run's redeem.
+ */
+interface Undo {
+  listed: string | null;
+  named: boolean;
+  namedBefore: string | null | undefined;
+  relayWasOff: boolean;
+  windowOpen: boolean;
+  /** takes off what this run listed and puts back what it changed here: null when nothing was listed; never throws */
+  cleanup: (() => Promise<Unlisted | null>) | null;
+}
+
+const cleanUp = async (undo: Undo): Promise<Unlisted | null> => {
+  try { return await undo.cleanup?.() ?? null; } catch { return null; }
+};
+
+/** What a run that ended unbound says of the listing it took off, or could not. */
+const leftWords = (off: Unlisted | null): { readonly said: string; readonly listed?: boolean | null } => off === null ? { said: "" }
+  : off === "removed" ? { said: " This PC was taken off that account's list again; the invite may be spent.", listed: false }
+  : { said: " This PC may still be on that account's list: remove it on a device of that account.", listed: null };
+
+/** `outcome` with what became of a listing this run made added to its words and its object. */
+function withLeft(outcome: Outcome, off: Unlisted | null): Outcome {
+  const { said, listed } = leftWords(off);
+  if (said === "") return outcome;
+  return { ...outcome, ...outcome.message === undefined ? {} : { message: `${outcome.message}${said}` },
+    json: { ...outcome.json, ...typeof outcome.json["message"] === "string" ? { message: `${outcome.json["message"]}${said}` } : {}, listed } };
+}
 
 /** This PC's fresh proof that it is `serverId`, for the `account` role (POST /api/account/pc-proof): single use, a minute long. */
 async function pcProof(api: Api, serverId: string, signal?: AbortSignal): Promise<{ challenge_id: string; proof: string }> {
@@ -135,26 +195,54 @@ async function pcProof(api: Api, serverId: string, signal?: AbortSignal): Promis
   return { challenge_id: proof.challenge_id, proof: proof.proof };
 }
 
+/** Resolves when `signal` aborts: what was read meanwhile no longer counts. */
+const aborted = (signal: AbortSignal): Promise<"aborted"> => new Promise((resolve) => {
+  if (signal.aborted) resolve("aborted");
+  else signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+});
+
 export async function join(args: readonly string[], options: JoinOptions): Promise<number> {
   const parsed = parseJoinArgs(args, `${cli(options)} join`);
   const json = "error" in parsed ? args.includes("--json") : parsed.json;
   // with --json, stdout carries the one object, and everything a person would read goes to stderr
   const say = json ? options.err : options.out;
-  const end = (outcome: Outcome & { readonly message?: string }): number => {
-    if (outcome.message !== undefined) say(`${outcome.message}\n`);
+  let printed = false;
+  const end = (outcome: Outcome): number => {
+    if (printed) return outcome.code;
+    printed = true;
+    if (outcome.message !== undefined) { try { say(`${outcome.message}\n`); } catch {} }
     if (json) options.out(`${JSON.stringify(outcome.json)}\n`);
     return outcome.code;
   };
+  const undo: Undo = { listed: null, named: false, namedBefore: undefined, relayWasOff: false, windowOpen: false, cleanup: null };
+  try {
+    return end(await joinRun(args, parsed, options, say, undo));
+  } catch (error) {
+    // whatever went wrong, the one object is printed, and what this run left on this PC and the account's list goes
+    const off = await cleanUp(undo);
+    const name = error instanceof Error ? error.name : "Error";
+    const reason = error instanceof Error ? error.message : String(error);
+    if (options.signal.aborted) return end(withLeft(failed("stopped", off === null ? "Stopped. Nothing of the invite was used here." : "Stopped."), off));
+    return end(withLeft(failed("internal", `ovis join stopped on an error of its own (${name}: ${reason.slice(0, 200)}).`), off));
+  }
+}
+
+async function joinRun(args: readonly string[], parsed: ReturnType<typeof parseJoinArgs>, options: JoinOptions, say: (text: string) => void, undo: Undo): Promise<Outcome> {
   const command = `${cli(options)} join`;
-  if ("error" in parsed) return end(failed("usage", `${parsed.error}\n${USAGE_HINT(command)}`));
+  if ("error" in parsed) return failed("usage", `${parsed.error}\n${USAGE_HINT(command)}`);
+  const json = parsed.json;
   const source = parsed.source ?? ((options.inviteEnv ?? "") === "" ? null : { kind: "env" } as const);
-  if (source === null) return end(failed("usage", `${command} needs the invite a device of your account made. ${USAGE_HINT(command)}`));
+  if (source === null) return failed("usage", `${command} needs the invite a device of your account made. ${USAGE_HINT(command)}`);
   let line: string;
   try {
-    line = source.kind === "arg" ? source.text : source.kind === "env" ? options.inviteEnv ?? "" : source.kind === "file" ? options.readFile(source.path) : await options.readStdin();
+    if (source.kind === "stdin") {
+      const read = await Promise.race([options.readStdin(), aborted(options.signal)]);
+      if (read === "aborted" && options.signal.aborted) return failed("stopped", "Stopped. Nothing was sent.");
+      line = read;
+    } else line = source.kind === "arg" ? source.text : source.kind === "env" ? options.inviteEnv ?? "" : options.readFile(source.path);
   } catch {
     // never the path: it could be the invite itself, put where a path goes
-    return end(failed("usage", source.kind === "file" ? "Could not read the file --invite-file names. Nothing was sent." : "Could not read the invite from standard input. Nothing was sent."));
+    return failed("usage", source.kind === "file" ? "Could not read the file --invite-file names (it must be a file you can read). Nothing was sent." : "Could not read the invite from standard input. Nothing was sent.");
   }
   let invite: Awaited<ReturnType<typeof readJoinLine>>;
   try {
@@ -162,42 +250,46 @@ export async function join(args: readonly string[], options: JoinOptions): Promi
     invite = await readJoinLine(line.trim());
   } catch (error) {
     // a refusal names no part of the line; anything else is a fault of this runtime, not the line's
-    if (error instanceof JoinLineError) return end(failed("invite_invalid", NOT_AN_INVITE));
+    if (error instanceof JoinLineError) return failed("invite_invalid", NOT_AN_INVITE);
     throw error;
   }
   const account = invite.account;
-  if (parsed.account !== undefined && parsed.account !== account) {
-    return end(failed("account_mismatch", `The invite is for Ovis account ${account}, not the one --account names (${parsed.account}). Nothing was sent, and the invite was not used.`));
+  // the account is named by its start as Settings and `ovis status` show it, as `ovis add --account` takes it. A refusal
+  // does not name the invite's account: whoever made the invite chose it
+  if (parsed.account !== undefined && !pins(parsed.account, account)) {
+    return failed("account_mismatch", `The invite is for another Ovis account than the one --account names. Nothing was sent, and the invite was not used. ${cli(options)} status --json on a PC already in your account shows its full id.`);
   }
-  if (options.accountService === null) return end(failed("relay_unavailable", "The account service is off on this PC (OVIS_ACCOUNT_SERVICE_URL=off), so it joins no account. Nothing was sent."));
+  if (options.accountService === null) return failed("relay_unavailable", "The account service is off on this PC (OVIS_ACCOUNT_SERVICE_URL=off), so it joins no account. Nothing was sent.");
   // a pasted line never points this PC's account traffic, its proof or its listing, at another service
   if (invite.service !== options.accountService) {
-    return end(failed("invite_invalid", `This invite is for another account service than the one this PC uses (${options.accountService}). Nothing was sent. Ask for an invite on a device signed in to that service, or check OVIS_ACCOUNT_SERVICE_URL here.`));
+    return failed("invite_invalid", `This invite is for another account service than the one this PC uses (${options.accountService}). Nothing was sent. Ask for an invite on a device signed in to that service, or check OVIS_ACCOUNT_SERVICE_URL here.`);
   }
   // a list id says the account keeps a signed member list: joining it on the service's word alone would go around it
   if (invite.list !== null) {
-    return end(failed("not_available", "This invite is for an account with a signed member list, which needs a newer Ovis on this PC. Update it in Settings → Updates, then run this again. Nothing was sent."));
+    return failed("not_available", "This invite is for an account with a signed member list, which needs a newer Ovis on this PC. Update it in Settings → Updates, then run this again. Nothing was sent.");
   }
   let host: string;
   try { host = new URL(options.origin).host; } catch { host = ""; }
-  if (!isLoopbackHost(host)) return end(failed("not_available", `The server at ${options.origin} is not on a loopback address. Run ${command} only on the PC itself, with Ovis listening on 127.0.0.1 (HOST unset).`));
-  if (!options.running) return end(failed("not_running", `Ovis is not running on this PC. Start it (${cli(options)} start, or open the app), then run this again.`));
+  if (!isLoopbackHost(host)) return failed("not_available", `The server at ${options.origin} is not on a loopback address. Run ${command} only on the PC itself, with Ovis listening on 127.0.0.1 (HOST unset).`);
+  if (!options.running) return failed("not_running", `Ovis is not running on this PC. Start it (${cli(options)} start, or open the app), then run this again.`);
   // the invite came on standard input, which is then no terminal anybody types at
   const terminal = source.kind !== "stdin" && options.terminal === true;
   const flow: LinkOptions = { ...options, out: say, terminal };
   const api = localApi(flow);
   try {
-    return end(await joining(flow, api, { key: invite.key, privateKey: invite.privateKey, account, pinned: parsed.account !== undefined, json, platform: options.platform ?? process.platform }));
+    return await joining(flow, api, undo, { key: invite.key, privateKey: invite.privateKey, account, pinned: parsed.account !== undefined, json, platform: options.platform ?? process.platform });
   } catch (error) {
-    if (options.signal.aborted) return end(failed("stopped", "Stopped. Nothing of the invite was used here."));
-    if (!(error instanceof LocalError || error instanceof AwayError)) throw error;
-    return end(failed(error instanceof AwayError ? "not_running" : "not_added", `Could not add this PC: ${error instanceof LocalError ? error.reason : error.message}`));
+    if (!(error instanceof LocalError || error instanceof AwayError) || options.signal.aborted) throw error;
+    const off = await cleanUp(undo);
+    return withLeft(failed(error instanceof AwayError ? "not_running" : "not_added", `Could not add this PC: ${(error instanceof LocalError ? error.reason : error.message).replace(/[.\s]*$/, ".")}`), off);
   }
 }
 
-async function joining(options: LinkOptions, api: Api, invite: { readonly key: string; readonly privateKey: CryptoKey; readonly account: string; readonly pinned: boolean; readonly json: boolean; readonly platform: string }): Promise<Outcome & { readonly message?: string }> {
+async function joining(options: LinkOptions, api: Api, undo: Undo,
+  invite: { readonly key: string; readonly privateKey: CryptoKey; readonly account: string; readonly pinned: boolean; readonly json: boolean; readonly platform: string }): Promise<Outcome> {
   const { out, signal } = options;
   const { account } = invite;
+  const now = options.now ?? Date.now;
   const service = options.accountService!;
   const serviceFetch: Fetch = options.serviceFetch ?? fetch;
   const wait = options.wait ?? ((ms: number, abort: AbortSignal) => new Promise<void>((resolve, reject) => {
@@ -213,7 +305,7 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly key: s
   }
   // in that account already: the invite is left for another PC
   if (status.account === account) {
-    return { code: JOIN_EXIT.ok, message: `This PC is already in Ovis account ${account}. The invite was not used.`, json: { ok: true, account, added: false, waiting: false, online: null } };
+    return { code: JOIN_EXIT.ok, message: `This PC is already in Ovis account ${account}. The invite was not used.`, json: { ok: true, account, added: false, online: null } };
   }
   if (status.account !== null) {
     return failed("other_account", `This PC is in another Ovis account (${shortAccount(status.account)}). Run ${cli(options)} logout to take it out of that one first, then run ${command} again. The invite was not used.`);
@@ -224,11 +316,20 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly key: s
       ? `The Ovis on this PC does not count this terminal as the PC itself (a forwarded port?), so it cannot be added from here. Run ${command} on the PC itself.`
       : `The Ovis on this PC cannot take an invite (its Step 2 is off, or it is older). Update it in Settings → Updates, then run this again.`);
   }
-  // nothing has gone to the account service so far, and nothing goes before the person here said this is the account
-  if (!invite.pinned) {
-    if (options.terminal !== true || options.isTty !== true) {
-      return failed("not_confirmed", `Not run in a terminal, so nobody here can confirm the account the invite is for. Run ${command} --account <the account's id> (Manage account in Settings shows it, and ${cli(options)} status on a PC already in it), or run ${command} in a terminal. Nothing was sent.`);
-    }
+  // nothing has gone to the account service so far, and nothing goes before the person here said this is the account.
+  // Under the fleet preview that is asked at a terminal only, --account or not, as `ovis add` does
+  const interactive = options.terminal === true && options.isTty === true;
+  const preview = options.preview === true;
+  if (preview && (!interactive || invite.json)) {
+    return failed("not_confirmed", `Adding this PC needs a terminal: there it asks whether the invite's account is yours. Run ${command} in a terminal (over ssh, run ssh -t). Nothing was sent.`);
+  }
+  if (!invite.pinned && invite.json) {
+    return failed("not_confirmed", `With --json nothing is asked: name the account with ${command} --account <the account's id> (${cli(options)} status --json on a PC already in it shows it). Nothing was sent.`);
+  }
+  if (!invite.pinned && !interactive) {
+    return failed("not_confirmed", `Not run in a terminal, so nobody here can confirm the account the invite is for. Run ${command} --account <the account's id> (Manage account in Settings shows it, and ${cli(options)} status on a PC already in it), or run ${command} in a terminal. Nothing was sent.`);
+  }
+  if (!invite.pinned || preview) {
     const asked = [
       `This invite adds this PC to Ovis account ${account}.`,
       "Compare this ID with Settings → Manage account → Account ID in your",
@@ -240,57 +341,104 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly key: s
       return failed("not_confirmed", "This PC was not added, and the invite was not used.");
     }
   } else out(`Ovis account ${account} is the one --account names.\n`);
+  // what this PC had before this run touches it: the relay off or on, and the account named for it (own window only)
+  const before = await api<{ phase?: unknown; relay_account?: unknown }>("GET", "/api/relay");
+  undo.namedBefore = typeof before.relay_account === "string" || before.relay_account === null ? before.relay_account : undefined;
   try { await relayOn(options, api); } catch (error) {
     if (!(error instanceof LocalError)) throw error;
     return failed("relay_unavailable", `${error.reason.replace(/[.\s]*$/, ".")} Nothing was sent.`);
   }
+  undo.relayWasOff = before.phase === "off";
+  let serverId: string | null = null;
+  const quick = (ms = 1_000) => ({ signal: AbortSignal.timeout(ms) });
+  /** Puts back what this run changed on this PC, for a run that ends with this PC in no account; never throws. */
+  const putBack = async (): Promise<void> => {
+    if (undo.windowOpen) await api("POST", "/api/relay/link/close", quick()).catch(() => undefined);
+    if (undo.named && undo.namedBefore !== undefined && undo.namedBefore !== account) await api("POST", "/api/account/relay-account", { body: { account: undo.namedBefore }, ...quick() }).catch(() => undefined);
+    if (undo.relayWasOff) await api("POST", "/api/relay/stop", quick()).catch(() => undefined);
+    undo.windowOpen = false;
+    undo.named = false;
+    undo.relayWasOff = false;
+  };
+  /** Takes this PC off `from`'s list by its own proof (POST /v1/pcs/{server_id}/leave), on signals of its own and within five seconds. */
+  const leave = async (from: string): Promise<Unlisted> => {
+    if (serverId === null) return "failed";
+    try {
+      const proof = await pcProof(api, serverId, AbortSignal.timeout(2_500));
+      const left = await serviceFetch(`${service}/v1/pcs/${serverId}/leave`, {
+        method: "POST", redirect: "error", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(2_500),
+        body: JSON.stringify({ server_id: serverId, account: from, ...proof }),
+      });
+      if (left.status !== 204) return "failed";
+      if (undo.listed === from) undo.listed = null;
+      return "removed";
+    } catch { return "failed"; }
+  };
+  undo.cleanup = async () => {
+    const off = undo.listed === null ? null : await leave(undo.listed);
+    await putBack();
+    return off;
+  };
+  /** Ends a run that left this PC in no account: what it listed goes, and what it changed here goes back. */
+  const unbound = async (outcome: Outcome): Promise<Outcome> => withLeft(outcome, await cleanUp(undo));
+  undo.windowOpen = true;
   const listing = await openedListing(api);
-  const serverId = listing.serverId;
-  const label = plainLabel(listing.entry.label).slice(0, 48) || serverId.slice(0, 8);
-  // the window opening the listing opened takes digits approved here, which this way does not ask for (addByPress closes it too)
-  const closeWindow = () => api("POST", "/api/relay/link/close", { signal: AbortSignal.timeout(5_000) }).catch(() => undefined);
+  serverId = listing.serverId;
+  const label = plainLabel(listing.entry.label).slice(0, 48) || listing.serverId.slice(0, 8);
   const redeemed = await redeem();
-  if (!("account" in redeemed)) {
-    await closeWindow();
-    return redeemed;
-  }
+  if (!("account" in redeemed)) return await unbound(redeemed);
   if (redeemed.account !== account) {
-    await closeWindow();
-    await leave(redeemed.account);
-    return failed("not_added", "The account service answered for another account than the invite's. This PC was not added.");
+    // the service listed this PC in another account than the invite's: that listing goes, under the account it named
+    undo.listed = redeemed.account;
+    return await unbound(failed("not_added", "The account service answered for another account than the invite's. This PC was not added."));
   }
   // the account this PC's relay pass is asked under, and the only one its one press takes
+  undo.named = true;
   const named = () => api("POST", "/api/account/relay-account", { body: { account } }).then(() => undefined, () => undefined);
   await named();
+  if (!redeemed.auto && redeemed.until !== null && redeemed.until <= now()) {
+    return await unbound(failed("no_add", "The card that offers Add for this PC ran out 10 minutes after the invite was first used. Ask for a new invite."));
+  }
   let ended: PressEnd | null = null;
   const code = await addByPress({ ...options, ...invite.json ? { terminal: false } : {} }, api, {
     signedIn: account, name: label, listedAt: null, confirmed: redeemed.auto,
+    // an auto invite's admission may take a moment to be there; a plain one's card ends when the service says
+    ...redeemed.auto ? { noneTries: 3 } : redeemed.until === null ? {} : { until: redeemed.until },
+    askBeforeUnlist: true, stopFast: true,
     unlist: () => leave(account), named, signOut: async () => undefined,
     words: joinWords(options, account, redeemed.auto), report: (end) => { ended = end; },
   });
-  const outcome = ended as PressEnd | null;
-  if (outcome === null) return { code, json: code === 0 ? { ok: true, account, added: true, waiting: false, online: null } : { ok: false, error: "not_added", message: "This PC was not added." } };
-  switch (outcome.kind) {
-    case "added": return { code, json: { ok: true, account, added: true, waiting: false, online: outcome.online } };
-    case "elsewhere": return { code: JOIN_EXIT.other_account, json: { ok: false, error: "other_account", message: `This PC joined another Ovis account (${shortAccount(outcome.account)}), not the one the invite is for.` } };
-    case "not_added": {
-      const error: JoinError = outcome.why === "timeout" ? "no_add" : outcome.why === "stopped" ? "stopped" : "not_added";
-      const message = outcome.why === "timeout" ? "Nobody pressed Add for this PC within 10 minutes of its listing."
-        : outcome.why === "stopped" ? "Stopped before this PC was added."
-        : outcome.why === "none_waiting" ? "The invite's add was not there to take (it lasts 10 minutes from the invite's first use)."
-        : "This PC was not added.";
-      return { code: JOIN_EXIT[error], json: { ok: false, error, message, listed: outcome.listed } };
-    }
+  const outcome = (ended as PressEnd | null) ?? (code === 0 ? { kind: "added", online: false } as const : { kind: "not_added", why: "failed", listed: null } as const);
+  if (outcome.kind === "added") {
+    undo.listed = null;
+    return { code, json: { ok: true, account, added: true, online: outcome.online } };
   }
+  if (outcome.kind === "elsewhere") {
+    return { code: JOIN_EXIT.other_account, json: { ok: false, error: "other_account", message: `This PC joined another Ovis account (${shortAccount(outcome.account)}), not the one the invite is for.` } };
+  }
+  const error: JoinError = outcome.why === "timeout" ? "no_add" : outcome.why === "stopped" ? "stopped" : "not_added";
+  const message = outcome.why === "timeout" ? "Nobody pressed Add for this PC while its card offered it."
+    : outcome.why === "stopped" ? "Stopped before this PC was added."
+    : outcome.why === "none_waiting" ? "The invite's add was not there to take (it lasts 10 minutes from the invite's first use)."
+    : "This PC was not added.";
+  // the auto invite's listing addByPress keeps (it is the account's own): this run made it, and it goes
+  if (outcome.why === "none_waiting") return await unbound({ code: JOIN_EXIT[error], message: "This PC was not added.", json: { ok: false, error, message } });
+  // addByPress took the listing off, or said why not
+  undo.listed = null;
+  await putBack();
+  return { code: JOIN_EXIT[error], json: { ok: false, error, message, listed: outcome.listed } };
 
   /**
-   * POST /v1/pc-invites/redeem with this PC's listing and a fresh proof of its key. A proof that lapsed on the way, or
-   * the service's try_again, is asked again twice; a refusal is told by its name only, never by the service's words.
+   * POST /v1/pc-invites/redeem with this PC's listing, a fresh proof of its key and the invite's signature over both. A
+   * proof that lapsed on the way, or the service's try_again, is asked again twice. An answer that did not come, or
+   * came unreadable, may hide a listing the service made: the same PC and key get the same answer, so it is asked
+   * again, and when it still says nothing the listing is taken off. A refusal is told by its name only.
    */
   async function redeem(): Promise<Redeemed> {
+    let unclear = 0;
     for (let attempt = 0; ; attempt++) {
       let proof: { challenge_id: string; proof: string };
-      try { proof = await pcProof(api, serverId); } catch (error) {
+      try { proof = await pcProof(api, listing.serverId); } catch (error) {
         if (signal.aborted || !(error instanceof LocalError)) throw error;
         if (error.code === "account_unavailable") return failed("service_unreachable", "The account service did not answer this PC. Try again in a moment: the invite works for 15 minutes.");
         return failed("not_available", `The Ovis on this PC gave no proof that it is this PC (${error.reason.replace(/[.\s]*$/, "")}). Update it in Settings → Updates, then run this again.`);
@@ -298,32 +446,43 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly key: s
       const os = accountOsOfPlatform(invite.platform);
       // signed again for every try: each answers a challenge of its own
       let signature: string;
-      try { signature = await signInviteRedeem({ account, server_id: serverId, public_key: listing.entry.public_key, challenge_id: proof.challenge_id }, invite.privateKey); } catch (error) {
+      try { signature = await signInviteRedeem({ account, server_id: listing.serverId, public_key: listing.entry.public_key, challenge_id: proof.challenge_id }, invite.privateKey); } catch (error) {
         if (!(error instanceof InviteRedeemError)) throw error;
         return failed("not_added", "The account service's challenge is not one this command signs for. This PC was not added.");
       }
+      // from here the service may list this PC, whatever comes back
+      undo.listed = account;
       let response: Response;
+      let body: unknown = null;
+      let readable = true;
       try {
         // never redirected: the invite's key, its signature and the proof go to this PC's account service alone
         response = await serviceFetch(`${service}/v1/pc-invites/redeem`, {
           method: "POST", redirect: "error", headers: { "content-type": "application/json" }, signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
-          body: JSON.stringify({ invite_key: invite.key, invite_signature: signature, server_id: serverId, public_key: listing.entry.public_key, relay: listing.entry.relay, label, ...os === null ? {} : { os }, ...proof }),
+          body: JSON.stringify({ invite_key: invite.key, invite_signature: signature, server_id: listing.serverId, public_key: listing.entry.public_key, relay: listing.entry.relay, label, ...os === null ? {} : { os }, ...proof }),
         });
+        try { body = await response.json(); } catch { readable = false; }
       } catch {
-        if (signal.aborted) {
-          // the service may have taken the invite just as the run stopped: what it listed goes again
-          const off = await leave(account);
-          return failed("stopped", off === "removed" ? "Stopped. This PC is in no account, and the invite's account does not list it."
-            : `Stopped. The invite's account may list this PC: run ${command} again with the same invite within its 15 minutes to finish, or remove it on a device of that account.`, { listed: off === "removed" ? false : null });
-        }
-        return failed("service_unreachable", "Could not reach the account service. Check this PC's internet connection and try again: the invite works for 15 minutes.");
+        if (signal.aborted) return failed("stopped", "Stopped while the account service was asked to list this PC.");
+        response = new Response(null, { status: 599 });
+        readable = false;
       }
-      let body: unknown = null;
-      try { body = await response.json(); } catch {}
-      if (response.status === 200) {
-        const answer = body as { account?: unknown; listing_id?: unknown; auto?: unknown } | null;
-        if (typeof answer?.account !== "string" || typeof answer.listing_id !== "string" || typeof answer.auto !== "boolean") return failed("not_added", "The account service sent an answer this command does not read. Update Ovis on this PC, then run this again.");
-        return { account: answer.account, listing: answer.listing_id, auto: answer.auto };
+      if (signal.aborted) return failed("stopped", "Stopped while the account service was asked to list this PC.");
+      if (response.status === 200 && readable) {
+        const answer = body as { account?: unknown; auto?: unknown; card_until?: unknown; admission_until?: unknown } | null;
+        if (typeof answer?.account === "string" && typeof answer.auto === "boolean") {
+          // the service's own clock: its deadline counted from its Date, not this PC's
+          const deadline = Date.parse(typeof answer.card_until === "string" ? answer.card_until : "");
+          const told = Date.parse(response.headers.get("date") ?? "");
+          return { account: answer.account, auto: answer.auto, until: Number.isFinite(deadline) ? now() + deadline - (Number.isFinite(told) ? told : now()) : null };
+        }
+      }
+      if (response.status === 200 || response.status >= 500 || !readable) {
+        if (++unclear < 3) {
+          await wait(1_000, signal);
+          continue;
+        }
+        return failed("service_unreachable", "The account service did not say whether it took this PC. Try again in a moment.");
       }
       const said = (body as { error?: { code?: unknown } } | null)?.error?.code;
       const code = typeof said === "string" && /^[a-z0-9_]{1,40}$/.test(said) ? said : null;
@@ -331,28 +490,17 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly key: s
         await wait(1_000, signal);
         continue;
       }
-      const header = Number(response.headers.get("retry-after"));
-      const retryAfter = Number.isSafeInteger(header) && header >= 0 ? header : null;
+      // a definite refusal lists nothing; after a try whose answer was lost it may have, so that one is still taken off
+      if (unclear === 0) undo.listed = null;
+      const header = response.headers.get("retry-after")?.trim() ?? "";
+      const retryAfter = /^[0-9]{1,9}$/.test(header) ? Number(header) : null;
       if (response.status === 400 && code === "invite_invalid") return failed("invite_invalid", INVITE_DEAD);
       if (response.status === 429 && code === "pc_add_cap") return failed("pc_add_cap", `Your Ovis account has added as many PCs as it may for now: try again in ${inTime(retryAfter)}. The invite was not used.`, { retry_after: retryAfter });
       if (response.status === 429) return failed("rate_limited", `The account service asks this PC to wait: try again in ${inTime(retryAfter)}.`, { retry_after: retryAfter });
       if (response.status === 409 && code === "directory_full") return failed("directory_full", `Your account holds as many PCs as it can. Remove one in the Ovis app, then run ${command} again (with a new invite once this one ran out).`);
       if (response.status === 404) return failed("not_available", `The account service takes no PC invites for this account. Add this PC with ${cli(options)} add instead.`);
-      if (response.status >= 500) return failed("service_unreachable", `The account service did not answer this PC (HTTP ${response.status}). Try again in a moment: the invite works for 15 minutes.`);
       return failed("not_added", `The account service did not take this PC (${code ?? `HTTP ${response.status}`}). This PC was not added.`);
     }
-  }
-
-  /** Takes this PC off `from`'s list by its own proof (POST /v1/pcs/{server_id}/leave), on signals of its own: Ctrl+C aborted the run's. */
-  async function leave(from: string): Promise<Unlisted> {
-    try {
-      const proof = await pcProof(api, serverId, AbortSignal.timeout(5_000));
-      const left = await serviceFetch(`${service}/v1/pcs/${serverId}/leave`, {
-        method: "POST", redirect: "error", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(5_000),
-        body: JSON.stringify({ server_id: serverId, account: from, ...proof }),
-      });
-      return left.status === 204 ? "removed" : "failed";
-    } catch { return "failed"; }
   }
 }
 
