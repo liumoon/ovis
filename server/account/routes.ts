@@ -6,7 +6,7 @@ import { sameOrigin } from "../machine-security.ts";
 import { parseIntroducedPcs } from "./introductions.ts";
 import { ACCOUNT_HELD_MAX } from "./holds.ts";
 import { AccountAddError } from "../machines.ts";
-import { pressOnce } from "./one-press.ts";
+import { notePressAsk, pressOnce, waitingForAdd } from "./one-press.ts";
 import { applyAccountRecords, applyEnrollment, applyLink, type LinkRefusal } from "./records.ts";
 
 const LINK_STATUS: Record<LinkRefusal, number> = {
@@ -55,6 +55,8 @@ export async function handleAccountRequest(request: Request, pathname: string, c
       ...(devices.addAtPcRequired() ? { pc_add_required: true } : {}),
       ...devices.accountRows(), removals: devices.accountRemovals(), adds: devices.accountAdds(), blocked,
       enrolling: context.services.accountHolds.enrolling(), blocked_all: mailbox.holdsEveryAdd(), ...(fresh === undefined ? {} : { fresh }), mailbox: { last_pull_at: mailbox.lastPullAt, error: mailbox.error },
+      // a yes or no only, never the account asked for: the account is named here once this PC is in it
+      waiting_for_add: waitingForAdd(devices),
     });
   }
   if (request.method !== "POST") return fail("method_not_allowed", "use POST", 405);
@@ -88,6 +90,7 @@ export async function handleAccountRequest(request: Request, pathname: string, c
       const account = body.account;
       if (typeof account !== "string") return fail("invalid_account", "Name the account", 400);
       const pressed = await pressOnce(context.services, account);
+      notePressAsk(devices, pressed);
       return "refused" in pressed ? fail(pressed.refused.code, pressed.refused.message, pressed.refused.status) : reply(pressed);
     }
     case "/api/account/ssh-add": {

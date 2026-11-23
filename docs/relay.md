@@ -325,6 +325,8 @@ ovis login --qr         # the same sign-in, then scan this PC's QR code with a d
 ovis login --approve    # the same sign-in, then approve here the device that adds this PC
 ovis login --google     # either, at Google's own device page (--github: GitHub's)
 ovis login --no-browser # show the address and code only (the default over SSH or without a desktop)
+ovis join --invite-file <path> # join the account an invite from a device of it is for, with no sign-in here
+ovis join -             # the same, with the invite on standard input
 ovis pair --relay       # a code to type and the relay QR code, renewed until Ctrl+C (was: ovis link --code)
 ```
 
@@ -653,6 +655,79 @@ for it before they show or ask anything.
   since, in Settings or on another device, stays). Redeeming them follows the usual admission rules. A PC that runs the
   machine profile makes no such code (409 `machine_profile`): it takes devices through its Ovis
   account, so `link --code` says so, points to `add`, and has nothing to take back.
+
+- **`join`** adds this PC to an account with an **invite**: one line (`ovis-invite:1:` then the
+  account's id and a secret) that a device signed in to the account made, which works once, for 15
+  minutes ([PC invites](account.md#pc-invites)). Nothing is signed in to on the PC. Give it the
+  invite in a file (`--invite-file <path>`), on standard input (`ovis join -`) or in `OVIS_INVITE`;
+  `ovis join <invite>` works too, but a line on the command line shows in the process list to every
+  user of the PC, so a script or an agent writes it to a file only it can read. The command trims
+  the line and checks its form before anything else, and refuses any other line (the account
+  list's `ovis-join:1:` line among them) with nothing sent. It never prints the invite or writes it
+  anywhere, and sends it to the account service alone, never through a redirect.
+
+  Whoever handed over the invite chose the account, so before anything is sent the command shows
+  that account's id, says where to compare it, and asks you to type `yes`, as `add` does
+  (**This invite adds this PC to Ovis account …. Is this your account? Type yes to add this PC to
+  it**). Anything else ends the run with the invite unused. `--account <id>` checks the id instead of
+  asking: it must be the invite's account exactly, and otherwise the run ends with nothing sent at
+  all. Where nobody can type (no terminal, or the invite came on standard input) it runs only with
+  `--account`. A PC in that account already says so and ends well without using the invite; a PC in
+  another account is refused, and the command names `ovis logout`.
+
+  Then it turns the relay on, and lists this PC in the account with its own key's proof (`POST
+  /api/account/pc-proof`, then `POST /v1/pc-invites/redeem` with the listing `add` would make: the
+  PC's name, relay key and relay, and its system), and names the account for its relay pass. From
+  there it is `add`: with a **plain** invite it says to press **Add** for the PC on a device of the
+  account (its card shows for 10 minutes), and waits for it as `add` waits, asking this PC every 6
+  seconds to take the admission (`POST /api/account/one-press`). An **auto** invite needs no Add: the
+  first ask takes it. Either way the PC is then in the account, its relay comes online, and the
+  command says **Added.** and, at a terminal, goes on to the first device's six digits as `add`
+  does. Ctrl+C, the 10 minutes, or a refusal take this PC off the account's list again by its own
+  proof (`POST /v1/pcs/{server_id}/leave`), and say so. Run with the same invite again within its 15
+  minutes, the command picks up where a run that could not take the PC off the list stopped: the
+  account service answers the same PC and key with the same listing.
+
+  `--json` prints one JSON object on standard output at the end, and everything else (the question
+  included) on standard error. With it the command never waits for a first device's digits.
+
+  ```
+  { "ok": true, "account": "<id>", "added": true, "waiting": false, "online": true }
+  { "ok": true, "account": "<id>", "added": false, "waiting": false, "online": null }    (in that account already)
+  { "ok": false, "error": "<name>", "message": "<one line>" }
+  ```
+
+  `online` says whether the relay came online within 30 seconds (the PC is added either way).
+  `rate_limited` and `pc_add_cap` carry `retry_after` (seconds, or null); `no_add`, `stopped` and
+  `not_added` after the PC was listed carry `listed`: whether the account still lists it (null: not
+  known). Each name has its exit code:
+
+  | Exit | `error` | What happened |
+  |---|---|---|
+  | 0 | | Added, or in that account already |
+  | 1 | `not_added`, `stopped` | Not added: the PC or the account service refused, or Ctrl+C |
+  | 2 | `usage` | No invite, two ways at once, an unknown flag, a file that could not be read |
+  | 3 | `invite_invalid` | Not an invite line, or one the service does not take: mistyped, used or expired |
+  | 4 | `not_confirmed` | Not `yes` at the question, or nobody to ask and no `--account` |
+  | 5 | `account_mismatch` | `--account` names another account than the invite's |
+  | 6 | `other_account` | This PC is in another account (`ovis logout` first) |
+  | 7 | `rate_limited` | The account service asks this PC to wait |
+  | 8 | `pc_add_cap` | The account added as many PCs as it may for now; the invite stays unused |
+  | 9 | `directory_full` | The account's list of PCs is full |
+  | 10 | `service_unreachable` | The account service did not answer |
+  | 11 | `not_available` | Not here: invites off for the account, an Ovis too old or not this PC's own |
+  | 12 | `relay_unavailable` | The relay cannot run here, or the account service is off on this PC |
+  | 13 | `not_running` | Ovis is not running on this PC |
+  | 14 | `no_add` | Nobody pressed Add within 10 minutes |
+
+  `ovis status --json` prints where the PC stands, for an agent to read before or after:
+  `{ "version", "running", "server_id", "relay": { "on", "connected", "phase" } | null, "account",
+  "account_known", "waiting_for_add" }`. `account` is the id of the account the PC is in (null for
+  none), told only to the app's owner, as `ovis status` names it: `account_known` is false where the
+  command was not let in as the owner. `waiting_for_add` is true while a run of `add` or `join`
+  (or the PC's own window) asked for its admission in the last 30 seconds and found none yet (null
+  from an older Ovis). `server_id` comes from this PC's own window or CLI only (`GET /api/relay`
+  names it to no other caller). Nothing in it is a token, a key or an e-mail address.
 
 **Which copy runs.** An in-app update (**Settings → Updates**) installs a new release beside the
 plugin checkout and does not replace the checkout. `link` follows the release that runs, as

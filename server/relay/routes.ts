@@ -17,7 +17,8 @@ export async function handleRelayRequest(request: Request, pathname: string, con
   const fail = (code: string, message: string, status: number) => reply({ error: { code, message } }, status);
   if (pathname === "/api/relay" && request.method === "GET") {
     setRequestRoute("/api/relay");
-    return reply(service.status());
+    // this PC's ID goes to its own window and CLI (`ovis status --json`), not to every device that reads the relay's state
+    return reply(own ? { ...service.status(), server_id: service.serverId() ?? null } : service.status());
   }
   const peer = context.peer;
   // one admission rule (docs/account.md): this PC itself, or a drive account member through the relay

@@ -6,7 +6,7 @@
  * internal names. Nothing here reads a file or the network.
  */
 
-export type Command = "start" | "stop" | "status" | "pair" | "link" | "logout" | "recover" | "confirm" | "phone" | "phone-setup" | "tui";
+export type Command = "start" | "stop" | "status" | "pair" | "link" | "join" | "logout" | "recover" | "confirm" | "phone" | "phone-setup" | "tui";
 
 export type Parsed =
   | { readonly kind: "help"; readonly text: string }
@@ -57,6 +57,18 @@ const SPECS: Readonly<Record<string, Spec>> = {
   login: LOGIN,
   add: LOGIN,
   link: LOGIN,
+  join: {
+    command: "join", passThrough: true,
+    summary: "Add this PC to an Ovis account with an invite from a device of it",
+    usage: "ovis join --invite-file <path> | - | <invite> [--account <id>] [--json]",
+    flags: [
+      ["--invite-file <path>", "Read the invite from a file"],
+      ["-", "Read the invite from standard input"],
+      ["--account <id>", "The account the invite is for: asks nothing, and stops if the invite is for another (needed outside a terminal)"],
+      ["--json", "Print one JSON object on stdout at the end, and everything else on stderr"],
+    ],
+    more: "A device signed in to your account makes the invite: one line that works once, for 15 minutes. Pass it in a\nfile or on standard input: an invite typed on the command line shows in the process list to other users of this PC\n(OVIS_INVITE also works). The command shows the account the invite is for and asks you to type yes (or checks it\nagainst --account), then lists this PC in that account. A plain invite then waits up to 10 minutes for Add on a\ndevice of the account; an auto invite adds the PC at once.\n\nExit codes: 0 added (or already in that account), 1 not added or stopped, 2 usage, 3 invite not valid (mistyped,\nused or expired), 4 not confirmed, 5 --account names another account, 6 this PC is in another account,\n7 rate limited, 8 the account's daily PC adds used up, 9 the account's PC list full, 10 account service unreachable,\n11 not available here, 12 relay or account service off, 13 Ovis not running, 14 nobody pressed Add in 10 minutes.",
+  },
   logout: {
     command: "logout", gated: true,
     summary: "Take this PC out of its Ovis account",
@@ -83,7 +95,8 @@ const SPECS: Readonly<Record<string, Spec>> = {
   status: {
     command: "status",
     summary: "Show whether Ovis runs, where, its account and its version",
-    usage: "ovis status",
+    usage: "ovis status [--json]",
+    flags: [["--json", "One JSON object: version, running, server id, relay, account, waiting for Add"]],
   },
   start: { command: "start", summary: "Start Ovis on this PC", usage: "ovis start" },
   stop: { command: "stop", summary: "Stop Ovis on this PC", usage: "ovis stop" },
@@ -108,7 +121,7 @@ const SPECS: Readonly<Record<string, Spec>> = {
 };
 
 const GROUPS: readonly (readonly [string, readonly string[]])[] = [
-  ["Connect", ["login", "logout", "pair", "approve", "phone"]],
+  ["Connect", ["login", "join", "logout", "pair", "approve", "phone"]],
   ["Run", ["status", "start", "stop", "tui"]],
   ["Recovery (at this PC only)", ["recover", "confirm"]],
 ];

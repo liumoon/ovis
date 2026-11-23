@@ -771,3 +771,185 @@ describe("a PC's own leave (account#65)", () => {
     expect(await listed(service, token)).toEqual([machine.serverId]);
   });
 });
+
+describe("PC invites (POST /v1/pc-invites, /v1/pc-invites/redeem)", () => {
+  async function proofOf(service: FakeAccountService, machine: ReturnType<typeof pc>) {
+    const challenge = await (await service.fetch(post("/v1/pc/challenge", { server_id: machine.serverId, public_key: machine.publicKey }))).json() as { challenge_id: string; frame: string };
+    return { challenge_id: challenge.challenge_id, proof: answerServerChallenge(challenge.frame, machine.keys.secretKey, { server_id: machine.serverId, role: "account", connection_id: challenge.challenge_id }) };
+  }
+  const answer = async (response: Response) => {
+    const text = await response.text();
+    return { status: response.status, body: (text === "" ? {} : JSON.parse(text)) as Record<string, unknown> & { error?: { code: string; message?: string } } };
+  };
+  const made = async (service: FakeAccountService, token: string, body: unknown = {}) => answer(await service.fetch(post("/v1/pc-invites", body, token)));
+  const invite = async (service: FakeAccountService, account = "acct_1", auto = false): Promise<string> => {
+    const made_ = await made(service, service.issueToken(account), auto ? { auto: true } : {});
+    expect(made_.status).toBe(200);
+    return made_.body.invite as string;
+  };
+  const redeem = async (service: FakeAccountService, line: string, machine: ReturnType<typeof pc>, extra: Record<string, unknown> = {}) =>
+    answer(await service.fetch(post("/v1/pc-invites/redeem", { invite: line, server_id: machine.serverId, public_key: machine.publicKey, relay: "wss://relay.ovis.sh", label: "Desk", os: "linux", ...await proofOf(service, machine), ...extra })));
+  const admission = async (service: FakeAccountService, machine: ReturnType<typeof pc>, account = "acct_1") =>
+    answer(await service.fetch(post("/v1/pc/admission", { server_id: machine.serverId, account, with_listing_id: true, ...await proofOf(service, machine) })));
+  const press = async (service: FakeAccountService, machine: ReturnType<typeof pc>) =>
+    (await service.fetch(post(`/v1/pcs/${machine.serverId}/admit`, {}, service.issueToken("acct_1")))).status;
+
+  test("an own, fresh sign-in makes one, at most five open at once; a device code's or a stale sign-in makes none, and the body is strict", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    const token = service.issueToken("acct_1");
+    const first = await made(service, token);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ auto: false, expires_at: new Date(now + 15 * 60_000).toISOString() });
+    expect(first.body.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(first.body.invite).toMatch(/^ovis-invite:1:acct_1:[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/);
+    expect((await made(service, token, { auto: true })).body.auto).toBe(true);
+    for (const body of [{ auto: "yes" }, { other: 1 }, []]) expect((await made(service, token, body)).body.error?.code).toBe("invalid_request");
+    expect((await made(service, service.issueToken("acct_1", { device: true }))).body.error?.code).toBe("own_sign_in_required");
+    for (let open = 2; open < 5; open++) expect((await made(service, token)).status).toBe(200);
+    expect(await made(service, token)).toMatchObject({ status: 409, body: { error: { code: "invites_full" } } });
+    now += 11 * 60_000;
+    expect(await made(service, token)).toMatchObject({ status: 403, body: { error: { code: "session_not_fresh" } } });
+    service.pcInvites = false;
+    expect((await made(service, service.issueToken("acct_1"))).status).toBe(404);
+  });
+
+  test("a plain invite lists the PC once, waiting for Add on its card; the same PC asking again gets the same answer, any other PC the one dead body", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.opensAll = true;
+    const line = await invite(service);
+    const machine = pc();
+    const first = await redeem(service, line, machine);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ account: "acct_1", auto: false });
+    expect(service.pcs("acct_1")).toMatchObject([{ server_id: machine.serverId, label: "Desk", listed_by_device: true, listing_id: first.body.listing_id }]);
+    expect(await redeem(service, line, machine)).toEqual(first);
+    const dead = await redeem(service, line, pc());
+    expect(dead).toEqual({ status: 400, body: { error: { code: "invite_invalid", message: "This invite does not work" } } });
+    expect(await redeem(service, `${line.slice(0, -1)}${line.endsWith("A") ? "E" : "A"}`, pc())).toEqual(dead);
+    expect(await redeem(service, line.replace("ovis-invite", "ovis-join"), pc())).toEqual(dead);
+    // nobody pressed Add yet; then a device of the account does, and the PC takes the admission
+    expect((await admission(service, machine)).body.error?.code).toBe("no_admission");
+    expect(await press(service, machine)).toBe(200);
+    expect(await admission(service, machine)).toMatchObject({ status: 200, body: { account: "acct_1", listing_id: first.body.listing_id } });
+    // after the 15 minutes, not even the same PC gets it again
+    now += 15 * 60_000;
+    expect(await redeem(service, line, machine)).toEqual(dead);
+  });
+
+  test("an expired, revoked or garbled invite is the same dead body, after the PC's own proof and listing are checked", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    const expired = await invite(service);
+    const revoked = await invite(service);
+    const owner = service.issueToken("acct_1");
+    const id = ((await (await service.fetch(new Request(`${BASE}/v1/pc-invites`, { headers: { authorization: `Bearer ${owner}` } }))).json()) as { invites: { id: string }[] }).invites[1]!.id;
+    expect((await service.fetch(new Request(`${BASE}/v1/pc-invites/${id}`, { method: "DELETE", headers: { authorization: `Bearer ${owner}` } }))).status).toBe(204);
+    now += 15 * 60_000;
+    for (const line of [expired, revoked, "not an invite"]) expect((await redeem(service, line, pc())).body.error?.code).toBe("invite_invalid");
+    const machine = pc();
+    const line = await invite(service);
+    expect((await redeem(service, line, machine, { proof: "x".repeat(86) })).body.error?.code).toBe("proof_invalid");
+    expect((await redeem(service, line, machine, { public_key: pc().publicKey })).body.error?.code).toBe("server_key_mismatch");
+    expect((await redeem(service, line, machine, { relay: "https://relay.ovis.sh" })).body.error?.code).toBe("invalid_relay");
+    expect((await redeem(service, line, machine, { label: "a\u0007b" })).body.error?.code).toBe("invalid_label");
+    expect((await redeem(service, line, machine, { os: "beos" })).body.error?.code).toBe("invalid_request");
+    expect((await redeem(service, line, machine, { extra: true })).body.error?.code).toBe("invalid_request");
+    // none of those spent it
+    expect((await redeem(service, line, machine)).status).toBe(200);
+  });
+
+  test("an auto invite admits the PC at once, for 10 minutes; past the account's daily one-press cap it answers pc_add_cap with retry-after and stays open", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.opensAll = true;
+    const machine = pc();
+    expect((await redeem(service, await invite(service, "acct_1", true), machine)).body).toMatchObject({ account: "acct_1", auto: true });
+    expect((await admission(service, machine)).status).toBe(200);
+    // two more PCs fill the day's three adds
+    for (let added = 0; added < 2; added++) expect((await redeem(service, await invite(service, "acct_1", true), pc())).status).toBe(200);
+    const capped = await invite(service, "acct_1", true);
+    const late = pc();
+    const response = await service.fetch(post("/v1/pc-invites/redeem", { invite: capped, server_id: late.serverId, public_key: late.publicKey, relay: "wss://relay.ovis.sh", label: "Late", ...await proofOf(service, late) }));
+    expect(response.status).toBe(429);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("pc_add_cap");
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(service.pcs("acct_1").some((entry) => entry.server_id === late.serverId)).toBe(false);
+    // still open: asked again within its 15 minutes, it answers the same
+    expect((await redeem(service, capped, late)).body.error?.code).toBe("pc_add_cap");
+    now += 24 * 60 * 60_000;
+    expect((await redeem(service, capped, late)).body.error?.code).toBe("invite_invalid");
+    // the cap is past, but this invite's 15 minutes too: a new one adds it
+    expect((await redeem(service, await invite(service, "acct_1", true), late)).status).toBe(200);
+    // an auto admission not taken within 10 minutes is gone
+    const slow = pc();
+    expect((await redeem(service, await invite(service, "acct_1", true), slow)).status).toBe(200);
+    now += 10 * 60_000 + 1;
+    expect((await admission(service, slow)).body.error?.code).toBe("no_admission");
+  });
+
+  test("a plain invite's card offers Add for 10 minutes: then Add and the PC's ask answer listing_expired; the PC's leave ends the listing", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.opensAll = true;
+    const machine = pc();
+    expect((await redeem(service, await invite(service), machine)).status).toBe(200);
+    now += 10 * 60_000 + 1;
+    expect((await admission(service, machine)).body.error?.code).toBe("listing_expired");
+    const admit = await service.fetch(post(`/v1/pcs/${machine.serverId}/admit`, {}, service.issueToken("acct_1")));
+    expect([admit.status, ((await admit.json()) as { error: { code: string } }).error.code]).toEqual([409, "listing_expired"]);
+    const left = await service.fetch(post(`/v1/pcs/${machine.serverId}/leave`, { server_id: machine.serverId, account: "acct_1", ...await proofOf(service, machine) }));
+    expect(left.status).toBe(204);
+    expect(service.pcs("acct_1")).toEqual([]);
+    // a new invite lists it again, with a new card
+    expect((await redeem(service, await invite(service), machine)).status).toBe(200);
+    expect((await admission(service, machine)).body.error?.code).toBe("no_admission");
+  });
+
+  test("the account's list of PCs can be full; a PC is rate limited after ten tries in a window", async () => {
+    const service = new FakeAccountService();
+    const token = service.issueToken("acct_1");
+    for (let index = 0; index < DIRECTORY_MAX; index++) {
+      const other = pc();
+      expect((await service.fetch(new Request(`${BASE}/v1/pcs/${other.serverId}`, { method: "PUT", body: JSON.stringify({ label: "pc", public_key: other.publicKey, relay: "wss://relay.ovis.sh" }), headers: { authorization: `Bearer ${token}` } }))).status).toBe(200);
+    }
+    const line = await invite(service);
+    const machine = pc();
+    expect((await redeem(service, line, machine)).body.error?.code).toBe("directory_full");
+    for (let tries = 1; tries < 10; tries++) await redeem(service, "nothing", machine);
+    const response = await service.fetch(post("/v1/pc-invites/redeem", { invite: line, server_id: machine.serverId, public_key: machine.publicKey, relay: "wss://relay.ovis.sh", label: "Desk", ...await proofOf(service, machine) }));
+    expect([response.status, response.headers.get("retry-after")]).toEqual([429, "60"]);
+  });
+
+  test("GET lists open invites and used ones for a day, never the line; DELETE revokes an open one and refuses a used one", async () => {
+    let now = Date.parse("2026-11-24T00:00:00Z");
+    const service = new FakeAccountService(() => now);
+    service.requestPlace = { country: "KR", city: "Seoul" };
+    const owner = service.issueToken("acct_1");
+    const key = await client();
+    service.registerSessionKey(owner, key.spki, "Pixel");
+    const used = (await made(service, owner, { auto: true })).body;
+    const open = (await made(service, service.issueToken("acct_1"))).body;
+    const machine = pc();
+    expect((await redeem(service, used.invite as string, machine)).status).toBe(200);
+    const list = async (token = owner) => answer(await service.fetch(new Request(`${BASE}/v1/pc-invites`, { headers: { authorization: `Bearer ${token}` } })));
+    const listed = await list();
+    expect(JSON.stringify(listed.body)).not.toContain("ovis-invite:");
+    expect(listed.body.invites).toEqual([
+      { id: used.id, made_at: "2026-11-24T00:00:00.000Z", expires_at: "2026-11-24T00:15:00.000Z", auto: true, device_no: 1, device_label: "Pixel", yours: true, used_at: "2026-11-24T00:00:00.000Z",
+        used_by: { server_id: machine.serverId, listing_id: service.pcs("acct_1")[0]!.listing_id, label: "Desk", os: "linux", country: "KR", city: "Seoul" } },
+      { id: open.id, made_at: "2026-11-24T00:00:00.000Z", expires_at: "2026-11-24T00:15:00.000Z", auto: false, device_no: null, device_label: null, yours: false, used_at: null, used_by: null },
+    ]);
+    const remove = async (id: unknown, token = owner) => answer(await service.fetch(new Request(`${BASE}/v1/pc-invites/${String(id)}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } })));
+    expect((await remove(used.id)).body.error?.code).toBe("invite_used");
+    expect((await remove(open.id)).status).toBe(204);
+    expect((await remove(open.id, service.issueToken("acct_2"))).status).toBe(404);
+    expect((await remove("0".repeat(32))).status).toBe(404);
+    expect((await list(service.issueToken("acct_1", { device: true }))).body.error?.code).toBe("own_sign_in_required");
+    // the revoked one is gone from the list; the used one stays a day
+    expect(((await list()).body.invites as { id: string }[]).map((entry) => entry.id)).toEqual([used.id as string]);
+    now += 24 * 60 * 60_000;
+    expect((await list(service.issueToken("acct_1"))).body.invites).toEqual([]);
+  });
+});
