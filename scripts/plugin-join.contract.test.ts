@@ -14,6 +14,8 @@ import { pairingPc, type Pc } from "../server/account/pairing.test-helpers.ts";
 import { bounded } from "../server/relay/test-helpers.ts";
 import { handleRelayRequest } from "../server/relay/routes.ts";
 import { importPublicKey } from "../shared/relay-e2ee.ts";
+import { newInvite, signInviteRedeem } from "../shared/account-list-invite.ts";
+import { readJoinLine } from "../shared/account-list-join.ts";
 import { join, JOIN_EXIT } from "./plugin-join.ts";
 
 const pcs: Pc[] = [];
@@ -29,11 +31,19 @@ async function fresh(): Promise<Pc> {
   return made;
 }
 
+/** An invite as a device of OWNER makes one: the service gets its public key, the line keeps its private key. */
 async function inviteFor(made: Pc, auto = false): Promise<string> {
-  const response = await made.account.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${made.account.issueToken(OWNER)}` }, body: JSON.stringify(auto ? { auto: true } : {}) }));
+  const fresh = await newInvite(SERVICE, OWNER, null);
+  const response = await made.account.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${made.account.issueToken(OWNER)}` }, body: JSON.stringify({ invite_key: fresh.key, ...auto ? { auto: true } : {} }) }));
   expect(response.status).toBe(200);
-  return ((await response.json()) as { invite: string }).invite;
+  return fresh.line;
 }
+
+/** The private key the line carries, as it spells it, and the line's base64url after its prefix. */
+const secrets = (line: string): string[] => {
+  const payload = line.slice("ovis-join:1:".length);
+  return [payload, (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { secret: string }).secret];
+};
 
 /** Every file this PC keeps, read whole. */
 function stateFiles(dir: string): string[] {
@@ -94,8 +104,7 @@ test("a plain invite: the PC lists itself on its own proof, waits for Add on a d
   expect(run.waiting.slice(0, -1).every((said) => said === true)).toBe(true);
   expect(run.waiting.at(-1)).toBe(false);
   expect((await made.status()).waiting_for_add).toBe(false);
-  const secret = line.split(":").at(-1)!;
-  for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) expect(text.includes(secret) || text.includes("ovis-invite:")).toBe(false);
+  for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) for (const secret of secrets(line)) expect(text.includes(secret)).toBe(false);
 });
 
 test("an auto invite: the PC is in the account at once, with no Add", async () => {
@@ -105,8 +114,7 @@ test("an auto invite: the PC is in the account at once, with no Add", async () =
   expect(run.code).toBe(0);
   expect(run.asked).toEqual([200]);
   expect(made.devices.account()).toBe(OWNER);
-  const secret = line.split(":").at(-1)!;
-  for (const text of stateFiles(made.stateDir)) expect(text.includes(secret)).toBe(false);
+  for (const text of stateFiles(made.stateDir)) for (const secret of secrets(line)) expect(text.includes(secret)).toBe(false);
 });
 
 test("stopped while it waits, the PC takes itself off the account's list by its own proof, and keeps nothing of the invite", async () => {
@@ -117,8 +125,7 @@ test("stopped while it waits, the PC takes itself off the account's list by its 
   expect(JSON.parse(run.out)).toMatchObject({ ok: false, error: "stopped", listed: false });
   expect(made.devices.account()).toBeNull();
   expect(made.account.pcs(OWNER)).toEqual([]);
-  const secret = line.split(":").at(-1)!;
-  for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) expect(text.includes(secret)).toBe(false);
+  for (const text of [run.out, run.err, ...stateFiles(made.stateDir)]) for (const secret of secrets(line)) expect(text.includes(secret)).toBe(false);
 });
 
 test("past a plain invite's ten minutes this PC answers one press with listing_expired, not as an account service that does not answer", async () => {
@@ -128,9 +135,11 @@ test("past a plain invite's ten minutes this PC answers one press with listing_e
   const proof = await made.local("/api/account/pc-proof", { method: "POST", headers: { "x-herdr-machine": "1", "x-herdr-update": "1" }, body: {} });
   const offer = await made.local("/api/relay/link", { method: "POST", headers: { "x-herdr-update": "1", "x-ovis-local-only": "1" } });
   expect(offer.status).toBe(200);
+  const read = await readJoinLine(line);
+  const publicKey = bytesToHex(importPublicKey(identity.public_key));
   const redeemed = await made.account.fetch(new Request(`${SERVICE}/v1/pc-invites/redeem`, { method: "POST", body: JSON.stringify({
-    invite: line, server_id: identity.server_id, public_key: bytesToHex(importPublicKey(identity.public_key)), relay: "wss://relay.test", label: "PC",
-    challenge_id: proof.body.challenge_id, proof: proof.body.proof,
+    invite_key: read.key, invite_signature: await signInviteRedeem({ account: OWNER, server_id: identity.server_id, public_key: publicKey, challenge_id: proof.body.challenge_id as string }, read.privateKey),
+    server_id: identity.server_id, public_key: publicKey, relay: "wss://relay.test", label: "PC", challenge_id: proof.body.challenge_id, proof: proof.body.proof,
   }) }));
   expect(redeemed.status).toBe(200);
   const named = await made.local("/api/account/relay-account", { method: "POST", headers: { "x-herdr-machine": "1" }, body: { account: OWNER } });

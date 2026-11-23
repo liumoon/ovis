@@ -24,7 +24,7 @@ describe("the public names", () => {
     // join reads its own words: the invite may be one of them, or standard input (-)
     [["join", "--invite-file", "/x", "--json"], "join", ["--invite-file", "/x", "--json"]],
     [["join", "-", "--account=acct_1"], "join", ["-", "--account=acct_1"]],
-    [["join", "ovis-invite:1:acct_1:secret"], "join", ["ovis-invite:1:acct_1:secret"]],
+    [["join", "ovis-join:1:eyJ2IjoxfQ"], "join", ["ovis-join:1:eyJ2IjoxfQ"]],
   ] as const)("%j runs %s %j, the names every release speaks", (words, command, args) => {
     expect(parseCommand(words, ON)).toEqual({ kind: "run", command, args });
   });

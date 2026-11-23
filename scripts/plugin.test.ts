@@ -16,6 +16,7 @@ import { exportPublicKey, generateKeyPair } from "../shared/relay-e2ee.ts";
 import { trustRefusal } from "../server/herdr-core/discovery.ts";
 import { profileGroups } from "../server/herdr-discovery.ts";
 import { decodeOffer, encodeOffer } from "../shared/relay-offer.ts";
+import { newInvite } from "../shared/account-list-invite.ts";
 
 const ROOT = join(import.meta.dir, "..");
 let scratch: string;
@@ -834,10 +835,12 @@ describe("the state dir when run by hand", () => {
 });
 
 describe("ovis join, as the command runs it", () => {
-  const line = `ovis-invite:1:acct_1:${"Q".repeat(42)}w`;
   const env = () => ({ HOST: "127.0.0.1", PORT: "1", OVIS_STATE_DIR: join(scratch, "app-state") });
 
   it("reads the invite from a file or standard input, checks it before anything else, and answers --json with one object and its exit code", async () => {
+    // a line for the account service the command uses by default
+    const line = (await newInvite("https://account.ovis.sh", "acct_1", null)).line;
+    const payload = line.slice("ovis-join:1:".length);
     const file = join(scratch, "invite");
     writeFileSync(file, `${line}\n`, { mode: 0o600 });
     for (const [args, stdin] of [[["--invite-file", file, "--json"], undefined], [["-", "--json"], ` ${line}\n`]] as const) {
@@ -846,12 +849,16 @@ describe("ovis join, as the command runs it", () => {
       expect([args, result.exitCode]).toEqual([args, 13]);
       expect(JSON.parse(result.out)).toMatchObject({ ok: false, error: "not_running" });
       expect(result.err).toContain("Ovis is not running on this PC.");
-      for (const text of [result.out, result.err]) expect(text).not.toContain("Q".repeat(42));
+      for (const text of [result.out, result.err]) expect(text).not.toContain(payload.slice(-60));
     }
-    writeFileSync(file, `ovis-join:1:acct_1:${"Q".repeat(42)}w\n`);
+    writeFileSync(file, `ovis-invite:1:acct_1:${"Q".repeat(42)}w\n`);
     const wrong = await run("join", env(), { args: ["--invite-file", file] });
     expect(wrong.exitCode).toBe(3);
-    expect(wrong.out).toContain("That is not an Ovis PC invite");
+    expect(wrong.out).toContain("That is not an Ovis invite");
+    // a line for another account service than this PC's
+    writeFileSync(file, `${(await newInvite("https://account.test", "acct_1", null)).line}\n`);
+    const elsewhere = await run("join", env(), { args: ["--invite-file", file, "--json"] });
+    expect([elsewhere.exitCode, (JSON.parse(elsewhere.out) as { error: string }).error]).toEqual([3, "invite_invalid"]);
     const none = await run("join", env(), { args: [] });
     expect(none.exitCode).toBe(2);
     const fromEnv = await run("join", { ...env(), OVIS_INVITE: line }, { args: ["--json"] });

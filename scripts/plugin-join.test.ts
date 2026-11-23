@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
+import { newInvite } from "../shared/account-list-invite.ts";
 import { FakeAccountService } from "../shared/account-service-fake.ts";
 import { importPublicKey, importSecretKey } from "../shared/relay-e2ee.ts";
 import { encodeOffer } from "../shared/relay-offer.ts";
@@ -61,13 +62,17 @@ interface Run {
   /** stdout and stderr, as written */
   readonly out: string;
   readonly err: string;
+  /** the line this run was given, and the invite's own line it was made from */
   readonly line: string;
+  readonly made: string;
   readonly service: FakeAccountService;
   readonly serverId: string;
   /** this PC's calls, as `METHOD /path` */
   readonly local: string[];
   /** the account service's calls, as `METHOD /path` */
   readonly calls: string[];
+  /** what each of those calls carried */
+  readonly bodies: string[];
   /** what had been asked of the account service, and of this PC, when the question showed; null when it did not */
   readonly beforeQuestion: { readonly service: string[]; readonly local: string[] } | null;
   readonly pressed: string[];
@@ -102,6 +107,9 @@ interface Setup {
   readonly service?: FakeAccountService;
   readonly time?: ReturnType<typeof clock>;
   readonly stateDir?: string;
+  /** the account service and list id the invite's line names: this PC's service and no list by default */
+  readonly inviteService?: string;
+  readonly inviteList?: string;
 }
 
 async function joining(setup: Setup = {}): Promise<Run> {
@@ -113,12 +121,15 @@ async function joining(setup: Setup = {}): Promise<Run> {
   service.opensAll = true;
   await setup.prepare?.(service, time);
   const owner = service.issueToken("acct_1");
-  const made = await service.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${owner}`, "content-type": "application/json" }, body: JSON.stringify(setup.auto ? { auto: true } : {}) }));
-  const madeLine = ((await made.json()) as { invite: string }).invite;
+  const fresh = await newInvite(setup.inviteService ?? SERVICE, "acct_1", setup.inviteList ?? null);
+  const made = await service.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${owner}`, "content-type": "application/json" }, body: JSON.stringify({ invite_key: fresh.key, ...setup.auto ? { auto: true } : {} }) }));
+  expect(made.status).toBe(200);
+  const madeLine = fresh.line;
   const line = setup.line?.(madeLine) ?? madeLine;
   const state = { account: setup.inAccount ?? null as string | null, named: null as string | null };
   const local: string[] = [];
   const calls: string[] = [];
+  const bodies: string[] = [];
   const pressed: string[] = [];
   const stop = new AbortController();
   const serviceFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -126,6 +137,7 @@ async function joining(setup: Setup = {}): Promise<Run> {
     const request = new Request(input, init);
     const path = new URL(request.url).pathname;
     calls.push(`${request.method} ${path}`);
+    bodies.push(await request.clone().text());
     expect(new URL(request.url).origin).toBe(SERVICE);
     return await setup.serviceAnswer?.(path, request.clone()) ?? await service.fetch(request);
   };
@@ -193,18 +205,23 @@ async function joining(setup: Setup = {}): Promise<Run> {
     err: (text) => { err.push(text); heard(text); },
   });
   return {
-    code, out: out.join(""), err: err.join(""), line, service, serverId: identity.server_id, local, calls, beforeQuestion, pressed, stateDir,
+    code, out: out.join(""), err: err.join(""), line, made: madeLine, service, serverId: identity.server_id, local, calls, bodies, beforeQuestion, pressed, stateDir,
     listed: () => service.pcs("acct_1").filter((entry) => entry.server_id === identity.server_id),
   };
 }
 
-/** Nothing this run wrote shows the invite, or its secret apart. */
+/** The private key a join line carries, as the line spells it. */
+const secretOf = (line: string): string => (JSON.parse(Buffer.from(line.slice("ovis-join:1:".length), "base64url").toString("utf8")) as { secret: string }).secret;
+
+/** Nothing this run wrote shows the invite, or its secret apart, and nothing it sent the account service carries either. */
 function expectNoInvite(run: Run): void {
-  const secret = run.line.split(":").at(-1)!;
-  expect(secret.length).toBeGreaterThan(8);
-  for (const text of [run.out, run.err]) {
-    expect(text).not.toContain(secret);
-    expect(text).not.toContain("ovis-invite:");
+  const secret = secretOf(run.made);
+  expect(secret).toHaveLength(184);
+  const payload = run.made.slice("ovis-join:1:".length);
+  for (const text of [run.out, run.err, ...run.bodies]) {
+    for (const part of [secret, payload, secret.slice(40, 80), payload.slice(-60)]) expect(text).not.toContain(part);
+    // a line's start ({"v":1 in base64url): the prefix alone may be named, never what follows it
+    expect(text).not.toContain("ovis-join:1:eyJ");
   }
 }
 
@@ -223,12 +240,12 @@ describe("ovis join: the invite", () => {
       expectNoInvite(run);
     }
     // OVIS_INVITE only where no other form names one
-    const both = await joining({ args: ["--invite-file", "/invite", ...pinned], inviteEnv: "ovis-invite:1:acct_2:x", terminal: false, isTty: false, pressAfter: 1 });
+    const both = await joining({ args: ["--invite-file", "/invite", ...pinned], inviteEnv: "ovis-join:1:x", terminal: false, isTty: false, pressAfter: 1 });
     expect(both.code).toBe(0);
   });
 
   it("refuses two ways at once, none, an unknown flag and a bad --account before anything is asked, never repeating a word that could be the invite", async () => {
-    const line = `ovis-invite:1:acct_1:${"A".repeat(42)}w`;
+    const line = (await newInvite(SERVICE, "acct_1", null)).line;
     for (const [args, said] of [
       [[line, "--invite-file", "/invite"], "give the invite one way only"],
       [[line, line], "give the invite one way only"],
@@ -241,7 +258,7 @@ describe("ovis join: the invite", () => {
       const run = await joining({ args });
       expect([args, run.code]).toEqual([args, JOIN_EXIT.usage]);
       expect(run.out).toContain(said);
-      expect(run.out).not.toContain("A".repeat(42));
+      expect(run.out).not.toContain(secretOf(line).slice(40, 80));
       expect(run.local).toEqual([]);
       expect(run.calls).toEqual([]);
     }
@@ -251,14 +268,41 @@ describe("ovis join: the invite", () => {
     expect(parseJoinArgs(["--json", "-", "--account=acct_1"])).toEqual({ source: { kind: "stdin" }, account: "acct_1", json: true });
   });
 
-  it("refuses anything but an invite line, the account list's ovis-join:1: line among them, before any request", async () => {
-    for (const line of [(made: string) => made.replace("ovis-invite:1:", "ovis-join:1:"), (made: string) => `${made}x`, (made: string) => made.slice(0, -1), () => "hello", (made: string) => made.replace(":1:", ":2:")]) {
+  it("refuses anything but a join line in its one form, before any request, naming no part of it", async () => {
+    const NOT_ONE = "That is not an Ovis invite: an invite is one line that starts with ovis-join:1:, made on a device signed in to your account. Nothing was sent.\n";
+    for (const line of [
+      (made: string) => `${made}x`, (made: string) => made.slice(0, -1), () => "hello", (made: string) => made.replace("ovis-join:1:", "ovis-join:2:"),
+      (made: string) => made.replace("ovis-join:1:", "ovis-invite:1:"), () => `ovis-invite:1:acct_1:${"A".repeat(42)}w`, (made: string) => `${made}=`,
+    ]) {
       const run = await joining({ line });
       expect(run.code).toBe(JOIN_EXIT.invite_invalid);
-      expect(run.out).toBe("That is not an Ovis PC invite: an invite is one line that starts with ovis-invite:1:, made on a device signed in to your account. Nothing was sent.\n");
+      expect(run.out).toBe(NOT_ONE);
       expect(run.local).toEqual([]);
       expect(run.calls).toEqual([]);
+      expectNoInvite(run);
     }
+  });
+
+  it("acts only on a line for this PC's own account service, and only on one for an account with no list yet; nothing is sent otherwise", async () => {
+    for (const other of ["https://account.ovis.sh", "https://account.test:8443", "https://evil.example"]) {
+      const run = await joining({ inviteService: other });
+      expect([other, run.code]).toEqual([other, JOIN_EXIT.invite_invalid]);
+      expect(run.out).toBe("This invite is for another account service than the one this PC uses (https://account.test). Nothing was sent. Ask for an invite on a device signed in to that service, or check OVIS_ACCOUNT_SERVICE_URL here.\n");
+      expect([run.local, run.calls]).toEqual([[], []]);
+    }
+    const listed = await joining({ inviteList: "0f484e9226ad290aaac6dea9244aced4e2b7b97297ecd8d52d437a57c33e5383" });
+    expect(listed.code).toBe(JOIN_EXIT.not_available);
+    expect(listed.out).toBe("This invite is for an account with a signed member list, which needs a newer Ovis on this PC. Update it in Settings → Updates, then run this again. Nothing was sent.\n");
+    expect([listed.local, listed.calls]).toEqual([[], []]);
+  });
+
+  it("sends the invite's public key and a signature over this account, this PC and this challenge: never the line or its secret", async () => {
+    const run = await joining({ pressAfter: 1 });
+    expect(run.code).toBe(0);
+    const redeem = JSON.parse(run.bodies[run.calls.indexOf("POST /v1/pc-invites/redeem")]!) as Record<string, string>;
+    expect(Object.keys(redeem).sort()).toEqual(["challenge_id", "invite_key", "invite_signature", "label", "os", "proof", "public_key", "relay", "server_id"]);
+    expect(redeem.invite_signature).toMatch(/^[A-Za-z0-9_-]{86}$/);
+    expectNoInvite(run);
   });
 });
 
@@ -420,7 +464,9 @@ describe("ovis join: what the account service says", () => {
     const time = clock();
     const service = new FakeAccountService(time.now);
     const owner = service.issueToken("acct_1");
-    const line = ((await (await service.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${owner}` }, body: "{}" }))).json()) as { invite: string }).invite;
+    const fresh = await newInvite(SERVICE, "acct_1", null);
+    expect((await service.fetch(new Request(`${SERVICE}/v1/pc-invites`, { method: "POST", headers: { authorization: `Bearer ${owner}` }, body: JSON.stringify({ invite_key: fresh.key }) }))).status).toBe(200);
+    const line = fresh.line;
     time.pass(15 * 60_000);
     const run = await plainly({ service, time, line: () => line });
     expect(run.code).toBe(JOIN_EXIT.invite_invalid);

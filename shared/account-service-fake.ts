@@ -12,7 +12,8 @@ import { ACCOUNT_SNAPSHOT_V, SNAPSHOT_GONE, type AccountSnapshotPage, type Snaps
 import { accountOsOf, type AccountOs, type AccountPlace } from "./account-asker.ts";
 import { isWssOrigin } from "./relay-offer.ts";
 import { deriveServerId, proofKey, serverChallenge, verifyServerProof } from "./relay-server-proof.ts";
-import { parsePcInvite, PC_INVITE_TTL_MS } from "./pc-invite.ts";
+import { isListKeyEncoding, isListPoint } from "./account-list-entry.ts";
+import { verifyInviteRedeem } from "./account-list-invite.ts";
 
 export const CHALLENGE_TTL_MS = 60_000;
 /** How long a PC's own leave (POST /v1/pcs/{server_id}/leave) keeps a PUT without its proof from listing it again. */
@@ -99,6 +100,8 @@ export const PC_ADMITS_PER_DAY = 3;
 export interface FakeAdmission { id: string; server_id: string; account: string; label: string; key: string; at: string; os: AccountOs | null; country: string | null; city: string | null }
 /** How long an admission reaches its PC's mailbox: the PC lets a waiting account device compare digits only within it. */
 export const ADMISSION_TTL_MS = 10 * 60_000;
+/** How long a PC invite works, once. */
+export const PC_INVITE_TTL_MS = 15 * 60_000;
 /** Open PC invites (POST /v1/pc-invites) one account may hold at once. */
 export const INVITES_OPEN_MAX = 5;
 /** How long GET /v1/pc-invites still lists an invite after a PC used it. */
@@ -107,7 +110,8 @@ export const INVITE_USED_SHOWN_MS = 24 * 60 * 60_000;
 export const INVITES_PER_WINDOW = 20;
 export const REDEEMS_PER_WINDOW = 10;
 interface FakeInvite {
-  id: string; account: string; secret: string; auto: boolean; family: string; madeAt: number; revoked: boolean;
+  /** `key`: the invite's public key (`invite_key`), all the service is given of it: the join line's private key never comes here */
+  id: string; account: string; key: string; auto: boolean; family: string; madeAt: number; revoked: boolean;
   used: { at: number; server_id: string; public_key: string; listing_id: string; label: string; os: AccountOs | null; country: string | null; city: string | null } | null;
 }
 
@@ -833,17 +837,19 @@ export class FakeAccountService {
     if (path === "/v1/pc-invites" && request.method === "POST") {
       let body: unknown;
       try { body = JSON.parse(await request.text()); } catch { return problem(400, "invalid_request", "Send a JSON object"); }
-      if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).some((name) => name !== "auto" && name !== "key_proof")
-        || ((body as { auto?: unknown }).auto !== undefined && typeof (body as { auto?: unknown }).auto !== "boolean")) return problem(400, "invalid_request", "Send auto and key_proof only");
+      const made = body as { invite_key?: unknown; auto?: unknown; key_proof?: unknown };
+      if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).some((name) => !["invite_key", "auto", "key_proof"].includes(name))
+        || (made.auto !== undefined && typeof made.auto !== "boolean")
+        || typeof made.invite_key !== "string" || !isListKeyEncoding(made.invite_key) || !isListPoint(made.invite_key)) return problem(400, "invalid_request", "Send the invite's public key, and auto and key_proof only");
       if ((body as { key_proof?: unknown }).key_proof !== undefined) return problem(400, "challenge_invalid", "Ask for a new challenge and answer it");
       if (!recent) return problem(403, "session_not_fresh", "Sign in again on this device first");
       if (!this.withinRateLimit(`invites:${account}`, INVITES_PER_WINDOW)) return limited("rate_limited", 60);
       if ([...this.invites.values()].filter((invite) => invite.account === account && open(invite)).length >= INVITES_OPEN_MAX) return problem(409, "invites_full", "Revoke an open invite first");
-      const bytes = crypto.getRandomValues(new Uint8Array(32));
-      const invite: FakeInvite = { id: randomHex(16), account, secret: btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
-        auto: (body as { auto?: boolean }).auto === true, family: session.family, madeAt: now, revoked: false, used: null };
+      // a key is an invite once, of any account, open or not
+      if ([...this.invites.values()].some((invite) => invite.key === made.invite_key)) return problem(409, "invite_key_used", "Make a new key for a new invite");
+      const invite: FakeInvite = { id: randomHex(16), account, key: made.invite_key, auto: made.auto === true, family: session.family, madeAt: now, revoked: false, used: null };
       this.invites.set(invite.id, invite);
-      return json({ id: invite.id, invite: `ovis-invite:1:${account}:${invite.secret}`, expires_at: new Date(now + PC_INVITE_TTL_MS).toISOString(), auto: invite.auto });
+      return json({ id: invite.id, account, expires_at: new Date(now + PC_INVITE_TTL_MS).toISOString(), auto: invite.auto });
     }
     if (path === "/v1/pc-invites" && request.method === "GET") {
       const maker = (family: string) => {
@@ -879,10 +885,10 @@ export class FakeAccountService {
     if (!this.pcInvites) return problem(404, "not_found", "Unknown request");
     let body: Record<string, unknown>;
     try { body = JSON.parse(await request.text()) as Record<string, unknown>; } catch { return problem(400, "invalid_request", "Send a JSON object"); }
-    const strings = ["invite", "server_id", "public_key", "relay", "label", "challenge_id", "proof"];
+    const strings = ["invite_key", "invite_signature", "server_id", "public_key", "relay", "label", "challenge_id", "proof"];
     if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).some((name) => name !== "os" && !strings.includes(name))
       || strings.some((name) => typeof body[name] !== "string") || (body.os !== undefined && accountOsOf(body.os) === null) || !/^[0-9a-f]{32}$/.test(body.server_id as string)) {
-      return problem(400, "invalid_request", "Send the invite, this PC's listing and its proof");
+      return problem(400, "invalid_request", "Send the invite's key and signature, this PC's listing and its proof");
     }
     const serverId = body.server_id as string;
     const publicKey = body.public_key as string;
@@ -894,9 +900,10 @@ export class FakeAccountService {
     if (label.length < 1 || label.length > 48 || /\p{Cc}/u.test(label)) return problem(400, "invalid_label", "Name the PC in 1-48 characters");
     if (!this.takeProof({ server_id: serverId, challenge_id: body.challenge_id, proof: body.proof })) return problem(401, "proof_invalid", "Ask for a new challenge and answer it");
     const dead = problem(400, "invite_invalid", "This invite does not work");
-    const parts = parsePcInvite(body.invite as string);
-    const invite = parts === null ? undefined : [...this.invites.values()].find((held) => held.account === parts.account && held.secret === parts.secret);
+    const invite = [...this.invites.values()].find((held) => held.key === body.invite_key);
     if (invite === undefined || invite.revoked || this.now() - invite.madeAt >= PC_INVITE_TTL_MS || this.deletedAccounts.has(invite.account)) return dead;
+    // held by whoever holds the line: its private key signed for this account, this PC and this challenge (the account from the row, never the request)
+    if (!await verifyInviteRedeem({ account: invite.account, server_id: serverId, public_key: publicKey, challenge_id: body.challenge_id as string }, body.invite_signature, invite.key)) return dead;
     const account = invite.account;
     const directory = this.directories.get(account) ?? new Map<string, FakePc>();
     this.directories.set(account, directory);

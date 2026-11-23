@@ -7,12 +7,16 @@
  * (plugin-link.ts addByPress): a plain invite waits for Add on a device of the account, an auto invite is admitted at
  * once, and this PC takes that admission and binds itself through the same route.
  *
- * The invite line is a key to the account's list for 15 minutes: it is never printed, logged or written anywhere, and
- * goes to the account service alone. A line on the command line shows in the process list, so the help and the docs
- * name the file and standard input forms first.
+ * The invite is the signed list's join line (shared/account-list-join.ts): it carries the invite's private key, a key to
+ * the account's list for 15 minutes. It is never printed, logged, written anywhere or sent: the PC proves it holds it by
+ * a signature over this account, this PC and this one challenge (shared/account-list-invite.ts), and the account
+ * service, which has only the invite's public key, checks that. A line acts only on this PC's own account service. A
+ * line on the command line shows in the process list, so the help and the docs name the file and standard input forms
+ * first.
  */
 import { accountOsOfPlatform } from "../shared/account-asker.ts";
-import { parsePcInvite } from "../shared/pc-invite.ts";
+import { InviteRedeemError, signInviteRedeem } from "../shared/account-list-invite.ts";
+import { JoinLineError, readJoinLine } from "../shared/account-list-join.ts";
 import { isLoopbackHost } from "../server/access.ts";
 import { shortAccount } from "./plugin-cli.ts";
 import {
@@ -101,7 +105,7 @@ export function parseJoinArgs(args: readonly string[], command = "ovis join"): {
 
 const USAGE_HINT = (command: string): string => `Run ${command} --invite-file <path> (or ${command} - to read it from standard input). ${command} --help says more.`;
 
-const NOT_AN_INVITE = "That is not an Ovis PC invite: an invite is one line that starts with ovis-invite:1:, made on a device signed in to your account. Nothing was sent.";
+const NOT_AN_INVITE = "That is not an Ovis invite: an invite is one line that starts with ovis-join:1:, made on a device signed in to your account. Nothing was sent.";
 
 const INVITE_DEAD = "This invite does not work: it is mistyped, used or expired (an invite works once, for 15 minutes). Ask for a new one.";
 
@@ -152,23 +156,38 @@ export async function join(args: readonly string[], options: JoinOptions): Promi
     // never the path: it could be the invite itself, put where a path goes
     return end(failed("usage", source.kind === "file" ? "Could not read the file --invite-file names. Nothing was sent." : "Could not read the invite from standard input. Nothing was sent."));
   }
-  const invite = line.length > INVITE_READ_MAX ? null : parsePcInvite(line.trim());
-  if (invite === null) return end(failed("invite_invalid", NOT_AN_INVITE));
+  let invite: Awaited<ReturnType<typeof readJoinLine>>;
+  try {
+    if (line.length > INVITE_READ_MAX) throw new JoinLineError("length", "too long");
+    invite = await readJoinLine(line.trim());
+  } catch (error) {
+    // a refusal names no part of the line; anything else is a fault of this runtime, not the line's
+    if (error instanceof JoinLineError) return end(failed("invite_invalid", NOT_AN_INVITE));
+    throw error;
+  }
   const account = invite.account;
   if (parsed.account !== undefined && parsed.account !== account) {
     return end(failed("account_mismatch", `The invite is for Ovis account ${account}, not the one --account names (${parsed.account}). Nothing was sent, and the invite was not used.`));
   }
+  if (options.accountService === null) return end(failed("relay_unavailable", "The account service is off on this PC (OVIS_ACCOUNT_SERVICE_URL=off), so it joins no account. Nothing was sent."));
+  // a pasted line never points this PC's account traffic, its proof or its listing, at another service
+  if (invite.service !== options.accountService) {
+    return end(failed("invite_invalid", `This invite is for another account service than the one this PC uses (${options.accountService}). Nothing was sent. Ask for an invite on a device signed in to that service, or check OVIS_ACCOUNT_SERVICE_URL here.`));
+  }
+  // a list id says the account keeps a signed member list: joining it on the service's word alone would go around it
+  if (invite.list !== null) {
+    return end(failed("not_available", "This invite is for an account with a signed member list, which needs a newer Ovis on this PC. Update it in Settings → Updates, then run this again. Nothing was sent."));
+  }
   let host: string;
   try { host = new URL(options.origin).host; } catch { host = ""; }
   if (!isLoopbackHost(host)) return end(failed("not_available", `The server at ${options.origin} is not on a loopback address. Run ${command} only on the PC itself, with Ovis listening on 127.0.0.1 (HOST unset).`));
-  if (options.accountService === null) return end(failed("relay_unavailable", "The account service is off on this PC (OVIS_ACCOUNT_SERVICE_URL=off), so it joins no account. Nothing was sent."));
   if (!options.running) return end(failed("not_running", `Ovis is not running on this PC. Start it (${cli(options)} start, or open the app), then run this again.`));
   // the invite came on standard input, which is then no terminal anybody types at
   const terminal = source.kind !== "stdin" && options.terminal === true;
   const flow: LinkOptions = { ...options, out: say, terminal };
   const api = localApi(flow);
   try {
-    return end(await joining(flow, api, { line: line.trim(), account, pinned: parsed.account !== undefined, json, platform: options.platform ?? process.platform }));
+    return end(await joining(flow, api, { key: invite.key, privateKey: invite.privateKey, account, pinned: parsed.account !== undefined, json, platform: options.platform ?? process.platform }));
   } catch (error) {
     if (options.signal.aborted) return end(failed("stopped", "Stopped. Nothing of the invite was used here."));
     if (!(error instanceof LocalError || error instanceof AwayError)) throw error;
@@ -176,7 +195,7 @@ export async function join(args: readonly string[], options: JoinOptions): Promi
   }
 }
 
-async function joining(options: LinkOptions, api: Api, invite: { readonly line: string; readonly account: string; readonly pinned: boolean; readonly json: boolean; readonly platform: string }): Promise<Outcome & { readonly message?: string }> {
+async function joining(options: LinkOptions, api: Api, invite: { readonly key: string; readonly privateKey: CryptoKey; readonly account: string; readonly pinned: boolean; readonly json: boolean; readonly platform: string }): Promise<Outcome & { readonly message?: string }> {
   const { out, signal } = options;
   const { account } = invite;
   const service = options.accountService!;
@@ -277,12 +296,18 @@ async function joining(options: LinkOptions, api: Api, invite: { readonly line: 
         return failed("not_available", `The Ovis on this PC gave no proof that it is this PC (${error.reason.replace(/[.\s]*$/, "")}). Update it in Settings → Updates, then run this again.`);
       }
       const os = accountOsOfPlatform(invite.platform);
+      // signed again for every try: each answers a challenge of its own
+      let signature: string;
+      try { signature = await signInviteRedeem({ account, server_id: serverId, public_key: listing.entry.public_key, challenge_id: proof.challenge_id }, invite.privateKey); } catch (error) {
+        if (!(error instanceof InviteRedeemError)) throw error;
+        return failed("not_added", "The account service's challenge is not one this command signs for. This PC was not added.");
+      }
       let response: Response;
       try {
-        // never redirected: the invite and the proof go to the account service alone
+        // never redirected: the invite's key, its signature and the proof go to this PC's account service alone
         response = await serviceFetch(`${service}/v1/pc-invites/redeem`, {
           method: "POST", redirect: "error", headers: { "content-type": "application/json" }, signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
-          body: JSON.stringify({ invite: invite.line, server_id: serverId, public_key: listing.entry.public_key, relay: listing.entry.relay, label, ...os === null ? {} : { os }, ...proof }),
+          body: JSON.stringify({ invite_key: invite.key, invite_signature: signature, server_id: serverId, public_key: listing.entry.public_key, relay: listing.entry.relay, label, ...os === null ? {} : { os }, ...proof }),
         });
       } catch {
         if (signal.aborted) {

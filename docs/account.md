@@ -1607,20 +1607,24 @@ the account service gets an answer the relay refuses.
 ### PC invites
 
 A device signed in to the account can make an **invite** for a new PC, which joins with `ovis join`
-([relay.md](relay.md#a-pc-with-no-screen)) and no sign-in of its own. The line is
-`ovis-invite:1:<account>:<secret>`: the account's id (1-64 of `A-Z a-z 0-9 _ -`, not secret) and 32
-random bytes in base64url without padding (43 characters, the last one of `AEIMQUYcgkosw048`), as
-`/^ovis-invite:1:([A-Za-z0-9_-]{1,64}):[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/`
-(`shared/pc-invite.ts`). It works once, for 15 minutes, and an account holds at most five open. The
-`ovis-join:1:` line (`shared/account-list-join.ts`) is another thing, and no client takes it for an
-invite. Whoever gets the line can list a PC in the account for its devices to add, so a client
-shows the account part and gets a typed yes (or a matching `--account`) before it redeems it.
+([relay.md](relay.md#a-pc-with-no-screen)) and no sign-in of its own. An invite is a key: the device
+makes a P-256 key pair, gives the account service the public key alone (`invite_key`), and shows the
+signed list's join line, which carries the private key (`shared/account-list-join.ts`:
+`ovis-join:1:` and the base64url of `{"v":1,"service","account","list","secret"}`; `list` is empty
+while the account has no signed member list). The service never holds anything that redeems an
+invite. It works once, for 15 minutes, and an account holds at most five open. Whoever gets the line
+can list a PC in the account for its devices to add, so a client acts only on a line whose `service`
+is its own account service, shows the account and gets a typed yes (or a matching `--account`)
+before it redeems it. The PC proves it holds the line by signing, with its private key,
+`ovis-invite-redeem/1` and then the account, its `server_id`, its relay key and the id of the
+challenge its own proof answers in the same request, each length-prefixed
+(`shared/account-list-invite.ts` `signInviteRedeem`): a captured signature redeems nothing else.
 
 | request | body | answer |
 |---|---|---|
-| `POST /v1/pc-invites` | `{ "auto"?, "key_proof"? }` (at least `{}`) | `{ "id", "invite", "expires_at", "auto" }`: an own sign-in's. `auto` makes an invite whose PC is admitted at once, with no Add. `key_proof` (`{ "challenge_id", "signature" }`, from `POST /v1/pcs/challenge`, signed with this sign-in's device key) is needed only for a sign-in older than 10 minutes. 403 `own_sign_in_required`, 403 `session_not_fresh`, 400 `challenge_invalid`, 403 `frozen`, 409 `invites_full`, 429 `rate_limited`, 404 `not_found` (invites are off for the account), 400 `invalid_request` |
-| `POST /v1/pc-invites/redeem` | `{ "invite", "server_id", "public_key", "relay", "label", "os"?, "challenge_id", "proof" }` | `{ "account", "listing_id", "auto" }`: no bearer; the PC's proof answers a `POST /v1/pc/challenge` (`role` `account`, `connection_id` the challenge id, as for its mailbox). One 400 `invite_invalid` for every dead or malformed invite. Also 400 `invalid_request`, `server_key_mismatch`, `invalid_relay`, `invalid_label`, 401 `proof_invalid`, 409 `list_endpoint`, `directory_full`, `try_again`, 429 `pc_add_cap` (auto only, with `retry-after`; the invite stays open), 429 `rate_limited`, 404 `not_found`. The same PC and key asking again within the 15 minutes, while its listing is current, get the same answer |
-| `GET /v1/pc-invites` | | `{ "invites": [{ "id", "made_at", "expires_at", "auto", "device_no", "device_label", "yours", "used_at", "used_by": null \| { "server_id", "listing_id", "label", "os", "country", "city" } }] }`: open invites, and used ones for a day after their use. Never the line |
+| `POST /v1/pc-invites` | `{ "invite_key", "auto"?, "key_proof"? }` | `{ "id", "account", "expires_at", "auto" }`: an own sign-in's; the device shows its line only after this answer, and only for its own account. A key is an invite once (409 `invite_key_used`). `auto` makes an invite whose PC is admitted at once, with no Add. `key_proof` (`{ "challenge_id", "signature" }`, from `POST /v1/pcs/challenge`, signed with this sign-in's device key) is needed only for a sign-in older than 10 minutes. 403 `own_sign_in_required`, 403 `session_not_fresh`, 400 `challenge_invalid`, 403 `frozen`, 409 `invites_full`, 429 `rate_limited`, 404 `not_found` (invites are off for the account), 400 `invalid_request` |
+| `POST /v1/pc-invites/redeem` | `{ "invite_key", "invite_signature", "server_id", "public_key", "relay", "label", "os"?, "challenge_id", "proof" }` | `{ "account", "listing_id", "auto" }`: no bearer; the PC's proof answers a `POST /v1/pc/challenge` (`role` `account`, `connection_id` the challenge id, as for its mailbox), and `invite_signature` is checked against the invite's row (its account, never one the request names). One 400 `invite_invalid` for every dead, unknown or malformed invite and every signature that does not verify; a request that carries anything else (an `invite` line) is 400 `invalid_request`. Also 400 `invalid_request`, `server_key_mismatch`, `invalid_relay`, `invalid_label`, 401 `proof_invalid`, 409 `list_endpoint`, `directory_full`, `try_again`, 429 `pc_add_cap` (auto only, with `retry-after`; the invite stays open), 429 `rate_limited`, 404 `not_found`. The same PC and key asking again within the 15 minutes, while its listing is current, get the same answer |
+| `GET /v1/pc-invites` | | `{ "invites": [{ "id", "made_at", "expires_at", "auto", "device_no", "device_label", "yours", "used_at", "used_by": null \| { "server_id", "listing_id", "label", "os", "country", "city" } }] }`: open invites, and used ones for a day after their use. No line or key |
 | `DELETE /v1/pc-invites/{id}` | | 204, also for one revoked or expired; 409 `invite_used` once a PC used it (remove that PC instead); 404 `not_found` |
 
 After a plain invite's redeem, the PC's card (**Add this PC to your account?**) offers Add for 10

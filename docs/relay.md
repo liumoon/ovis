@@ -656,15 +656,19 @@ for it before they show or ask anything.
   machine profile makes no such code (409 `machine_profile`): it takes devices through its Ovis
   account, so `link --code` says so, points to `add`, and has nothing to take back.
 
-- **`join`** adds this PC to an account with an **invite**: one line (`ovis-invite:1:` then the
-  account's id and a secret) that a device signed in to the account made, which works once, for 15
-  minutes ([PC invites](account.md#pc-invites)). Nothing is signed in to on the PC. Give it the
-  invite in a file (`--invite-file <path>`), on standard input (`ovis join -`) or in `OVIS_INVITE`;
-  `ovis join <invite>` works too, but a line on the command line shows in the process list to every
-  user of the PC, so a script or an agent writes it to a file only it can read. The command trims
-  the line and checks its form before anything else, and refuses any other line (the account
-  list's `ovis-join:1:` line among them) with nothing sent. It never prints the invite or writes it
-  anywhere, and sends it to the account service alone, never through a redirect.
+- **`join`** adds this PC to an account with an **invite**: the signed list's join line
+  (`ovis-join:1:`, [PC invites](account.md#pc-invites)) that a device signed in to the account made,
+  which works once, for 15 minutes. It names the account service, the account, and carries the
+  invite's private key. Nothing is signed in to on the PC. Give it the invite in a file
+  (`--invite-file <path>`), on standard input (`ovis join -`) or in `OVIS_INVITE`; `ovis join
+  <invite>` works too, but a line on the command line shows in the process list to every user of
+  the PC, so a script or an agent writes it to a file only it can read. The command trims the line
+  and reads it in its one form before anything else, and refuses any other line with nothing sent.
+  It acts only on a line for the account service this PC uses (`OVIS_ACCOUNT_SERVICE_URL`, so a
+  staging PC takes staging lines) and, for now, only on one for an account with no signed member
+  list yet (a line with a list id says to update Ovis); both refusals send nothing. The line never
+  leaves the PC: it is not printed, logged, written or sent, and the PC proves it holds it by a
+  signature (below).
 
   Whoever handed over the invite chose the account, so before anything is sent the command shows
   that account's id, says where to compare it, and asks you to type `yes`, as `add` does
@@ -677,7 +681,10 @@ for it before they show or ask anything.
 
   Then it turns the relay on, and lists this PC in the account with its own key's proof (`POST
   /api/account/pc-proof`, then `POST /v1/pc-invites/redeem` with the listing `add` would make: the
-  PC's name, relay key and relay, and its system), and names the account for its relay pass. From
+  PC's name, relay key and relay, and its system). Beside them go the invite's public key and its
+  signature, by the line's private key, over the account, this PC's ID and relay key, and that
+  proof's challenge, made again for every try; the redeem goes to that service alone, never
+  through a redirect. Then it names the account for its relay pass. From
   there it is `add`: with a **plain** invite it says to press **Add** for the PC on a device of the
   account (its card shows for 10 minutes), and waits for it as `add` waits, asking this PC every 6
   seconds to take the admission (`POST /api/account/one-press`). An **auto** invite needs no Add: the
